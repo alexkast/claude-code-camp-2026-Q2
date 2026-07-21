@@ -1,0 +1,15 @@
+# World Map (graph)
+
+Each room lists its exits and where each one leads (`unknown` if
+unexplored). Never delete a known room, and never write the map as a fixed
+A -> B step list -- if it can only answer "how do I get to X" from one
+specific starting room, the map is wrong. It should work as a graph you can
+navigate from anywhere you've already been.
+
+## <Room Name>
+- <one-line description / notable features>
+- Exits:
+  - n -> unknown
+  - e -> unknown
+  - s -> unknown
+  - w -> unknown
