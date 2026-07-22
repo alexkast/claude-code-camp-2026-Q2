@@ -1,0 +1,122 @@
+# Python Port Plan — Step 00: Configuration
+
+## Goal
+
+Port `week1_baseline/ruby/00_config` to `week1_baseline/python/00_config`, producing a
+Python `boukensha` package that behaves identically to the Ruby one: same config
+directory resolution, same `settings.yaml` schema, same per-task prompt override
+rules, same example output. The two implementations should stay easy to compare
+side by side, step for step.
+
+## Reference files (Ruby source of truth)
+
+Read/port from these exact files — do not invent new behavior beyond what they define:
+
+| Ruby file | What it defines |
+|---|---|
+| `week1_baseline/ruby/00_config/lib/boukensha/config.rb` | `Boukensha::Config`: dir resolution (`BOUKENSHA_DIR` env var → `~/.boukensha`), `.env` loading via dotenv, `settings.yaml` loading via `YAML.safe_load`, `tasks`/`dig`/`mud_*`/`user_prompts_dir` accessors, `to_s`/`inspect` |
+| `week1_baseline/ruby/00_config/lib/boukensha/tasks/base.rb` | `Boukensha::Tasks::Base`: abstract class-method-only task (`task_name` raises `NotImplementedError`), `.provider`/`.model` (raise if missing), `.prompt_override?`, `.prompt`/`.system_prompt` (override file vs. shipped default) |
+| `week1_baseline/ruby/00_config/lib/boukensha/tasks/player.rb` | `Boukensha::Tasks::Player < Base`, `task_name = "player"` |
+| `week1_baseline/ruby/00_config/lib/boukensha.rb` | Top-level require wiring |
+| `week1_baseline/ruby/00_config/prompts/system.md` | Default system prompt shipped with the library |
+| `week1_baseline/ruby/00_config/examples/example.rb` | Runnable smoke-test printing config/task info |
+| `week1_baseline/ruby/00_config/Gemfile` | Only external dependency: `dotenv` |
+| `week1_baseline/ruby/00_config/README.md` | Design rationale, directory structure, schema, expected output — adapt wording, keep facts |
+| `week1_baseline/ruby/bin/00_config` | Wrapper: `cd` into `00_config`, run the example via bundler |
+| `week1_baseline/bin/ruby/00_config` | Top-level dispatcher: `cd` into `ruby/00_config`, run the example via bundler |
+
+Shared, **not** ported (already language-agnostic, reused as-is):
+
+- `.boukensha/` config directory itself (`settings.yaml`, `.env`, `prompts/player/system.md`) — same directory serves both Ruby and Python runs.
+
+## Design decisions (confirmed with user)
+
+- **Dependency management:** stdlib `venv` + `requirements.txt` (mirrors the Ruby side's
+  minimal-Gemfile philosophy — no Poetry/uv). `requirements.txt` needs `python-dotenv`
+  (equivalent of the `dotenv` gem) and `PyYAML` (stdlib has no YAML parser, and the
+  shared `settings.yaml` format is fixed since Ruby also reads it — this is the one new
+  dependency the Ruby version didn't need).
+- **Code style:** literal mirror of the Ruby OO design — keep `Config`, `Tasks.Base`,
+  `Tasks.Player` as classes with classmethods/staticmethods, `Base` as an ABC-like
+  class raising `NotImplementedError` for `task_name`. Do not redesign into plain
+  functions/dataclasses, so the two trees stay comparable step-by-step.
+- **Tests:** none for this step, matching Ruby parity. Only the runnable
+  `examples/example.py` smoke test. Revisit if/when the Ruby side adds `rspec`.
+
+## Target files to create
+
+```
+week1_baseline/python/00_config/
+  lib/boukensha/__init__.py        # top-level package init (mirrors lib/boukensha.rb)
+  lib/boukensha/config.py          # Config class
+  lib/boukensha/tasks/__init__.py
+  lib/boukensha/tasks/base.py      # Base task class
+  lib/boukensha/tasks/player.py    # Player(Base)
+  prompts/system.md                # copy verbatim from Ruby
+  examples/example.py              # smoke test, same output shape as example.rb
+  requirements.txt                 # python-dotenv, PyYAML
+  README.md                        # adapted from Ruby README
+
+week1_baseline/python/bin/00_config   # cd into ../00_config, run venv python examples/example.py
+week1_baseline/bin/python/00_config   # cd into ../../python/00_config, run venv python examples/example.py
+```
+
+## Porting notes / gotchas to handle deliberately
+
+1. **Symbol-vs-string keys.** Ruby's `dig`/`fetch` accept both `Hash` string and symbol
+   keys (`node[key.to_s] || node[key.to_sym]`) because `settings.yaml` keys load as
+   strings but callers pass symbols (`:player`, `:mud`). Python has no symbol/string
+   duality — `tasks(name)` and `dig(*keys)` should just accept plain strings throughout
+   (callers pass `"player"` instead of `:player`). Note this as an intentional,
+   documented deviation in the Python README, not a silent behavior change.
+2. **Path resolution for `PROMPTS_DIR`.** Ruby: `File.expand_path("../../prompts",
+   __dir__)` relative to `config.rb`'s own directory → resolves to `00_config/prompts`.
+   Python: use `pathlib.Path(__file__).resolve().parent.parent.parent / "prompts"`
+   relative to `lib/boukensha/config.py` (two levels up from `lib/boukensha/` to
+   `00_config/`, then into `prompts/`) — verify the level count against actual file
+   placement before committing.
+3. **`.strip()` semantics.** Ruby's `read_file` does `File.read(path).strip`; replicate
+   with Python's `.strip()` on file contents (default whitespace strip, same as Ruby).
+4. **`YAML.safe_load(...) || {}`.** PyYAML's `yaml.safe_load` returns `None` for an
+   empty file, same as Ruby returning `nil`/`false`-y — replicate the `or {}` fallback.
+5. **`ArgumentError`/`NotImplementedError` equivalents.** Use Python's built-in
+   `ValueError` for the Ruby `ArgumentError` cases (missing `provider`/`model`), and
+   `NotImplementedError` for the abstract `task_name` (Python has this built in,
+   unlike Ruby where it needed an explicit raise).
+6. **`ENV.fetch("BOUKENSHA_DIR", nil)`.** Python: `os.environ.get("BOUKENSHA_DIR")`.
+7. **Expected output parity.** The ported `examples/example.py` must produce output
+   matching the Ruby README's "Run Example" section (same field names/order), so the
+   port can be smoke-tested against the same `.boukensha/` fixture directory used by
+   the Ruby version.
+
+## Open questions (please confirm before/while implementing)
+
+1. **Python version floor.** Any target version to assume (e.g. 3.11+) for typing
+   syntax choices (`str | None` vs `Optional[str]`), or should it stay compatible with
+   an older minimum (3.9/3.10)?
+- Use Python 3.11+ compatibale
+2. **Type hints.** Ruby version has none. Should the Python port add type hints (common
+   Python convention) even though it's a literal mirror, or skip them for now to
+   minimize divergence from the Ruby source during this first pass?
+- Yes. Should be added
+3. **Package installability.** Is a bare `lib/` directory + `sys.path` manipulation in
+   the example/bin scripts acceptable (mirroring Ruby's `require_relative` style), or
+   would you rather make `boukensha` pip-installable (`pip install -e .`) via a
+   `pyproject.toml` even under the "requirements.txt" tooling choice?
+- Do in the same way as in Ruby.
+1. **`Gemfile.lock` equivalent.** Do you want a pinned `requirements.txt` (exact
+   versions, like `Gemfile.lock`) or an unpinned one (like the `Gemfile` itself, letting
+   `Gemfile.lock` be the pinned artifact)? Ruby ships both — Python's stdlib venv/pip
+   flow doesn't auto-generate a lock file, so this needs an explicit choice (e.g. a
+   `requirements.txt` with `==` pins, generated via `pip freeze`).
+- Yes. Do in the same way as in Ruby. So pin dependencies.
+
+## Acceptance criteria
+
+- `./week1_baseline/bin/python/00_config` runs against the same `.boukensha/` fixture
+  directory as the Ruby version and prints output matching the Ruby README's documented
+  example output (same fields, same values, allowing for the intentional string-vs-symbol
+  key deviation noted above).
+- `week1_baseline/python/00_config/README.md` documents the config schema, directory
+  resolution order, and the string-key deviation from Ruby.
+- No behavior invented beyond what the Ruby reference files above define.
