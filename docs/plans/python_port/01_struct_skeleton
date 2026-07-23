@@ -1,0 +1,139 @@
+# Python Port Plan — Step 01: Struct Skeleton
+
+## Goal
+
+Port `week1_baseline/ruby/01_struct_skeleton` to
+`week1_baseline/python/01_struct_skeleton`. This step adds three new data
+types on top of step 0's `Config`/`Tasks::Base`/`Tasks::Player`: `Tool` and
+`Message` (Ruby `Struct`s) and `Context` (a plain class that holds
+everything needed for one agent run — task, system prompt, messages,
+registered tools). Same behavior, same example output shape, same shared
+`.boukensha/` fixture directory as the Ruby version.
+
+## Reference files (Ruby source of truth)
+
+Read/port from these exact files — do not invent new behavior beyond what they define:
+
+| Ruby file | What it defines |
+|---|---|
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha/config.rb` | Same as 00_config's `Config` class, **minus** the `PROMPTS_DIR` constant — this step ships no `prompts/` directory of its own |
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha/tasks/base.rb` | Byte-identical to 00_config's `Tasks::Base` |
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha/tasks/player.rb` | Byte-identical to 00_config's `Tasks::Player` |
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha/tool.rb` | `Tool = Struct.new(:name, :description, :parameters, :block)` + custom `to_s` |
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha/message.rb` | `Message = Struct.new(:role, :content, :tool_use_id)` + custom `to_s` |
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha/context.rb` | `Context` class: `task`, `system`, `messages` (array), `tools` (hash); `register_tool`, `add_message(role, content, tool_use_id:)`, `tool_count`/`turn_count` (endless methods), custom `to_s` |
+| `week1_baseline/ruby/01_struct_skeleton/lib/boukensha.rb` | Require order: config → tasks/player → tool → message → context |
+| `week1_baseline/ruby/01_struct_skeleton/examples/example.rb` | Builds config, resolves player's system prompt, builds a `Context`, registers a `move` tool, adds 2 messages, prints a report |
+| `week1_baseline/ruby/01_struct_skeleton/Gemfile` | Only external dependency: `dotenv` (same as 00_config) |
+| `week1_baseline/ruby/01_struct_skeleton/README.md` | Design rationale (Structs vs. Classes), field tables for Tool/Message/Context, example `to_s` output |
+| `week1_baseline/ruby/bin/01_struct_skeleton` | Per-language wrapper (not executable, same convention as 00_config's) |
+| `week1_baseline/bin/ruby/01_struct_skeleton` | Top-level dispatcher (executable, same convention as 00_config's) |
+
+Confirmed: no `python/01_struct_skeleton`, `python/bin/01_struct_skeleton`, or
+`bin/python/01_struct_skeleton` exist yet.
+
+Shared, **not** ported (already language-agnostic, reused as-is):
+
+- `.boukensha/` config directory itself — same directory serves both Ruby and Python runs.
+
+## Conventions inherited from the 00_config port (not re-litigated here)
+
+- Python 3.11+, type hints throughout.
+- Literal 1:1 mirror of Ruby's class/classmethod structure.
+- String-only dict keys (Ruby's symbol/string dual lookup collapses to plain strings — e.g. `ctx.add_message("user", ...)` not `:user`).
+- Bare `lib/` directory + `sys.path` manipulation in `examples/example.py` (no pip-installable package), matching Ruby's `require_relative` style.
+- Per-step `requirements.txt` (unpinned, like `Gemfile`) + `requirements-lock.txt` (pinned via `pip freeze`, like `Gemfile.lock`), own `.venv`.
+- No automated tests yet (matches Ruby parity).
+- Bin wrapper executable-bit convention: per-language script (`python/bin/01_struct_skeleton`) **not** executable, top-level dispatcher (`bin/python/01_struct_skeleton`) executable.
+
+## Design decisions (confirmed with user)
+
+- **Struct → dataclass mapping:** Ruby's `Struct.new` for `Tool` and
+  `Message` ports to Python `@dataclass` — mutable (fields stay settable,
+  matching Ruby Struct semantics), supports type hints and a custom
+  `__str__`, and is the closest Python equivalent to "lightweight struct for
+  teaching, would be a full class in practice" (the exact tradeoff the Ruby
+  README calls out).
+- **README `token_budget` mismatch:** Ruby's own README documents a
+  `token_budget`/`budget=` field in its `Context` examples
+  (`#<Context turns=2 tools=1 budget=8192>`), but the actual `context.rb`
+  has no such attribute — only `task`, `system`, `messages`, `tools`. This is
+  aspirational/future documentation ahead of the code. The ported Python
+  README will describe only what `Context.__str__` actually produces today,
+  per the "no invented behavior" principle — it will **not** reproduce the
+  budget field.
+
+## Target files to create
+
+```
+week1_baseline/python/01_struct_skeleton/
+  lib/boukensha/__init__.py        # config, tasks.player, tool, message, context
+  lib/boukensha/config.py          # copy of 00_config's, minus PROMPTS_DIR
+  lib/boukensha/tool.py            # @dataclass Tool
+  lib/boukensha/message.py         # @dataclass Message
+  lib/boukensha/context.py         # Context class
+  lib/boukensha/tasks/__init__.py
+  lib/boukensha/tasks/base.py      # verbatim copy from python/00_config
+  lib/boukensha/tasks/player.py    # verbatim copy from python/00_config
+  examples/example.py              # same shape/output as example.rb
+  requirements.txt                 # python-dotenv, PyYAML (same as 00_config)
+  requirements-lock.txt            # pinned via pip freeze
+  README.md                        # adapted from Ruby README, budget field omitted
+
+week1_baseline/python/bin/01_struct_skeleton   # not executable
+week1_baseline/bin/python/01_struct_skeleton   # executable
+```
+
+## Porting notes / gotchas to handle deliberately
+
+1. **Slice arithmetic differs between the two Struct `to_s` methods** — easy
+   to get wrong by copy-pasting one pattern everywhere:
+   - `Tool#to_s`: `description.to_s[0..40]` is a Ruby *Range* (inclusive of
+     40) → 41 characters → Python `description[:41]`.
+   - `Message#to_s`: `content.to_s[0..60]` → 61 characters → Python
+     `content[:61]`.
+   - Contrast with 00_config's `example.rb`, which used `.slice(0, 60)` — a
+     *length*-based slice, not a range — so `[:60]` was correct there. Don't
+     reuse that slice width here.
+2. **Cosmetic list-repr deviation.** Ruby's `parameters.keys` on a
+   symbol-keyed hash prints like `[:direction]`; Python's string-keyed dict
+   prints `['direction']` via `list(parameters.keys())`. Document as an
+   intentional, non-functional deviation (same family as 00_config's
+   string-vs-symbol note) — do not hack around it to force exact text match.
+3. **`Context.tool_count`/`turn_count`** are Ruby endless methods (called
+   without parens, e.g. `turns=#{turn_count}`) → Python `@property` so
+   `ctx.tool_count` reads the same way, not `ctx.tool_count()`.
+4. **`config.py` has no `PROMPTS_DIR`** in this step, matching Ruby's
+   `config.rb`. `example.py` calls `Player.system_prompt(...)` with only
+   `user_prompts_dir=`, no `default_prompts_dir=` — matches Ruby exactly
+   (this step relies entirely on the shared `.boukensha/prompts/player/system.md`
+   override; there is no shipped fallback prompt for this step).
+5. **`Tool.block`** type hint: `Callable[..., Any]` (signature varies by
+   tool, mirrors Ruby's untyped `Proc`/lambda).
+6. **Path depth for `BOUKENSHA_DIR` override** in `example.py`: same nesting
+   depth as 00_config (`python/01_struct_skeleton/examples/` is 4 parents
+   from repo root), so reuse the already-verified
+   `Path(__file__).resolve().parents[4]` pattern from 00_config's
+   `example.py` — no new depth arithmetic to derive.
+7. **`config.py`, `tasks/base.py`, `tasks/player.py` are direct copies**
+   from `python/00_config` (config.py with `PROMPTS_DIR` removed per #4) —
+   the Ruby sources are byte-identical to 00_config's, so this is reuse, not
+   new translation work.
+8. **Boolean/text output parity**: reuse the `.lower()` fix applied in
+   00_config's `example.py` wherever a Python bool is interpolated into
+   printed output, so `True`/`False` don't leak into the printed report
+   (this step's `example.rb` doesn't print any raw booleans directly, but
+   keep this in mind if the report format changes).
+
+## Acceptance criteria
+
+- `./week1_baseline/bin/python/01_struct_skeleton` runs against the same
+  shared `.boukensha/` fixture directory as the Ruby version and prints
+  output matching `example.rb`'s shape: a `Config:` line, a `Context:` line,
+  a `Tool:` line, and a `Messages:` section with 2 entries — modulo the
+  documented cosmetic deviations (string-only keys, list-repr formatting).
+- `week1_baseline/python/01_struct_skeleton/README.md` documents the
+  Struct→dataclass mapping, the intentionally omitted `PROMPTS_DIR`, and why
+  the `budget`/`token_budget` field is absent from the Python `Context`
+  output (matches the real code, not the aspirational Ruby README prose).
+- No behavior invented beyond what the Ruby reference files above define.
