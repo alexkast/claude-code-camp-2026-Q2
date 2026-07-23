@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+cd "$(dirname "$0")/../../python/03_prompt_builder"
+./.venv/bin/python examples/example.py
