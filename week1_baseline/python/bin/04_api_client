@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+cd "$(dirname "$0")/../04_api_client"
+./.venv/bin/python examples/example.py
