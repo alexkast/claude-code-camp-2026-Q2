@@ -1,0 +1,223 @@
+# Python Port Plan — Step 05: The Agent Loop
+
+## Goal
+
+Port `week1_baseline/ruby/05_agent_loop` to
+`week1_baseline/python/05_agent_loop`. This is the step where everything
+prior (structs, registry, prompt builder, client) gets wired into an actual
+agent loop: `Agent#run` sends a request, checks the normalized
+`stop_reason`, dispatches any tool calls via the `Registry`, feeds the
+results back, and repeats — up to a configurable `max_iterations` ceiling,
+after which it makes one tools-disabled "wind-down" call instead of raising.
+Every backend gains a `parse_response` (raw response → common shape) and,
+where needed, an inverse `assistant_message`/`assistant_parts` (common shape
+→ provider-specific replay format). Also adds `Tasks::Base.max_iterations`/
+`.max_output_tokens`, a (currently unused) `LoopError`, and `tools:`
+passthrough on `PromptBuilder`/`Client`/each backend's `to_payload`.
+
+**⚠️ Bigger safety note than step 4.** `example.py` will run a real,
+multi-turn agentic loop against the live Anthropic API (per current
+`settings.yaml`) — not just one request. It registers real `read_file`/
+`list_directory` tools scoped to the port's own directory, and the loop can
+make up to `max_iterations` (default 25, but realistically 1-3 for this
+task) real billed round-trips, actually reading files and listing
+directories under `python/05_agent_loop/` for real. Confirm before running
+during implementation/testing, the same way step 4 was confirmed.
+
+## Reference files (Ruby source of truth)
+
+Read/port from these exact files — do not invent new behavior beyond what they define:
+
+| Ruby file | What it defines |
+|---|---|
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/context.rb` | Byte-identical to `04_api_client`'s `Context` (the Ruby README claims it now "carries the active task object" — stale prose, `Context` has had `task` since `01_struct_skeleton`; ignore this claim) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/message.rb` | Byte-identical to `04_api_client`'s `Message` |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/tool.rb` | Byte-identical to `04_api_client`'s `Tool` |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/registry.rb` | Byte-identical to `04_api_client`'s `Registry` |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/tasks/player.rb` | Byte-identical to `04_api_client`'s `Tasks::Player` |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/backends/base.rb` | Byte-identical to `04_api_client`'s `Backends::Base` |
+| `week1_baseline/ruby/05_agent_loop/Gemfile` | Unchanged: `dotenv` only |
+| `week1_baseline/ruby/05_agent_loop/prompts/system.md` | Byte-identical content to `04_api_client`'s |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/config.rb` | **Cosmetic only**: `mud_host`/`mud_port`/`mud_username`/`mud_password` rewritten as Ruby endless methods (`def mud_host = ...`) — same return values, no functional change. Python `config.py` needs no edits, reuse verbatim. |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/errors.rb` | **Changed**: adds `Boukensha::LoopError < StandardError` alongside the existing 3 errors — confirmed via `grep` that `LoopError` is declared but **never raised or referenced anywhere** in this step's code (README calls it "Added for runaway agents" but nothing wires it up yet — likely reserved for a future step). Port the class, don't invent a use for it. |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/tasks/base.rb` | **Changed**: adds `DEFAULT_MAX_ITERATIONS = 25`, `DEFAULT_MAX_OUTPUT_TOKENS = 1024`, `.max_iterations(settings)`/`.max_output_tokens(settings)` (via private `integer_setting(settings, key, default)` — returns the default if the setting is absent, else `Integer(value)`) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/prompt_builder.rb` | **Changed**: `to_api_payload` gains `tools:` passthrough (`nil` by default — `nil` means "let the backend build tools from context.tools", non-`nil` e.g. `[]` means "use exactly this"), adds `parse_response(response)` delegating to the backend. `to_messages` **still has the 1-arg arity bug** we already fixed in the Python port at step 3 — continue reusing that fix here (see Design decisions). |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/client.rb` | **Changed**: `call` gains a `tools:` keyword, passed straight through to `builder.to_api_payload`. Retry/backoff logic itself is unchanged from `04_api_client`. |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/backends/anthropic.rb` | **Changed**: `to_payload` gains `tools:` passthrough; adds `parse_response(response)` (maps `stop_reason` to `"tool_use"`/`"end_turn"`, passes `content` through as-is — Anthropic's wire format doubles as the normalized shape, so **no** `assistant_message`/`assistant_parts` needed) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/backends/gemini.rb` | **Changed**: `to_payload` gains `tools:` passthrough; `to_messages`'s `:assistant` case now calls new private `assistant_parts(content)` (rebuilds Gemini `parts` from normalized content blocks — text → `{text: ...}`, tool_use → `{functionCall: {name, args}}`); adds `parse_response` (reads `candidates[0].content.parts`, maps `functionCall` parts → tool_use blocks using the function **name** as the id since Gemini assigns no call ids, `text` parts → text blocks) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/backends/ollama.rb` | **Changed**: `to_payload` gains `tools:` passthrough; `to_messages`'s `:assistant` case now calls new private `assistant_message(content)` (text blocks joined into `content:`, tool_use blocks become `tool_calls: [{function: {name, arguments}}]`, name reused as id); adds `parse_response` (reads `message.tool_calls`, name reused as id since Ollama assigns none) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/backends/ollama_cloud.rb` | **Changed**: identical shape of changes to `ollama.rb` (same `assistant_message`/`parse_response` logic, same tool-result field name `tool_name`) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/backends/openai.rb` | **Changed**: adds top-level `require "json"`; `to_payload` gains `tools:` passthrough; `to_messages`'s `:assistant` case calls new private `assistant_message(content)` (tool_calls rebuilt with real `id`s — OpenAI **does** assign call ids — `function.arguments` re-serialized to a JSON **string** via `.to_json`); adds `parse_response` (reads `choices[0].message.tool_calls`, `function.arguments` is a JSON **string** on the wire and must be `JSON.parse`d back into a hash for the normalized `input` field) |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha/agent.rb` | **New** — the loop itself. See "Agent translation" below for the full method-by-method breakdown. |
+| `week1_baseline/ruby/05_agent_loop/lib/boukensha.rb` | Require order: ...(unchanged from `04_api_client`)..., plus `require_relative "boukensha/agent"` at the end |
+| `week1_baseline/ruby/05_agent_loop/examples/example.rb` | Builds config/context/registry/backend/builder/client, builds an `Agent` with `task_settings: player_settings`, registers `read_file`/`list_directory` tools scoped to **the step's own root directory** (`File.expand_path("..", __dir__)` from `examples/`, i.e. `05_agent_loop/`, not `examples/`), adds one user message ("Read the README.md file and summarise..."), prints config/provider/model/max_iterations/max_output_tokens, calls `agent.run`, prints the final text response |
+| `week1_baseline/ruby/05_agent_loop/README.md` | Architecture (`send → stop_reason? → dispatch/loop or return`), the "every backend speaks the same normalized shape" rationale, tool-call-id-per-backend table, task config recap (now with `max_iterations`/`max_output_tokens` in the YAML example), sample loop output, "Considerations" (assistant-before-tool_result ordering, multi-tool-per-turn, `MAX_ITERATIONS` as a turn ceiling not a hard stop, agent can't unilaterally decide to stop) |
+| `week1_baseline/ruby/bin/05_agent_loop` | Per-language wrapper (not executable, same convention as prior steps) |
+| `week1_baseline/bin/ruby/05_agent_loop` | Top-level dispatcher (executable, same convention as prior steps) |
+
+Confirmed via diff: `context.rb`, `message.rb`, `tool.rb`, `registry.rb`,
+`tasks/player.rb`, `backends/base.rb`, `Gemfile`, and `prompts/system.md`
+are byte-identical to `04_api_client`'s versions. No `python/05_agent_loop`,
+`python/bin/05_agent_loop`, or `bin/python/05_agent_loop` exist yet.
+
+Also note (same precedent as prior steps): the Ruby README's "Updated Files"
+table claims `config.rb` "reads `tasks.player` instead of top-level
+provider/model settings" — stale prose carried forward verbatim from step 4,
+still not true (unchanged since `02_the_registry`). The Python README
+documents real behavior, not this recurring copy-paste artifact.
+
+## Conventions inherited from prior steps (not re-litigated here)
+
+- Python 3.11+, type hints throughout, literal 1:1 class mirror.
+- String-only dict keys everywhere (`ctx.add_message("assistant", ...)` not `:assistant`, etc.)
+- `to_messages(system, messages)` uniform 2-arg signature across **all** backends (the step-3 fix) — `PromptBuilder.to_messages()`/`to_payload` continue calling it that way; Anthropic/Gemini continue ignoring the `system` arg in their own message-list building.
+- `model_info_for` classmethod naming (step-3 fix), `requests` library for `Client` (step-4 decision), instance no-arg methods as `@property`.
+- Bare `lib/` + `sys.path` manipulation, per-step `requirements.txt`/`requirements-lock.txt` + own `.venv`, no automated tests yet, bin wrapper executable-bit convention.
+
+## Reuse: copy verbatim
+
+- From `python/04_api_client`: `context.py`, `message.py`, `tool.py`, `registry.py`, `tasks/player.py`, `config.py`, `backends/base.py`, `backends/__init__.py` (update its re-exports if new names are added — none this step), `prompts/system.md`.
+- `errors.py`, `tasks/base.py`, `prompt_builder.py`, `client.py`, and all 5 backend files are **not** verbatim reuse — each needs the additions described above layered onto the `04_api_client` Python version (which already carries forward the step-3 `to_messages` arity fix, so no re-fixing needed, just add `tools:` passthrough and `parse_response`/`assistant_message`).
+
+## Agent translation (`lib/boukensha/agent.py`)
+
+Direct method-by-method mapping from `agent.rb`:
+
+| Ruby | Python |
+|---|---|
+| `MAX_ITERATIONS = 25` | class attr `MAX_ITERATIONS = 25` |
+| `WRAP_UP_OUTPUT_TOKENS = 400` | class attr `WRAP_UP_OUTPUT_TOKENS = 400` |
+| `WRAP_UP_DIRECTIVE` heredoc | Python triple-quoted string, **same embedded newlines**, stripped — get the exact wording and line breaks right, it's sent to the model |
+| `initialize(context:, registry:, builder:, client:, task_settings: nil, max_iterations: nil, max_output_tokens: nil)` | `__init__(self, *, context, registry, builder, client, task_settings=None, max_iterations=None, max_output_tokens=None)` |
+| `run` | `run(self) -> str` — same `loop do ... end` shape as a `while True:` |
+| `resolve_max_iterations` | `int(explicit)` if given, else `self.context.task.max_iterations(task_settings)` if `task_settings` truthy and `hasattr(self.context.task, "max_iterations")`, else `self.MAX_ITERATIONS` |
+| `resolve_max_output_tokens` | same shape, but falls back to `None` (not a constant) if nothing resolves it |
+| `iteration_limit_reached?` | `self.max_iterations > 0 and self.iteration >= self.max_iterations` (property or plain method — Ruby's is a private no-arg helper, keep it a private method, not a `@property`, since it's implementation detail not a public accessor) |
+| `call_opts` | returns `{"max_output_tokens": self.max_output_tokens}` if truthy else `{}`, spread into `self.client.call(**self.call_opts())` |
+| `wrap_up(reason)` | adds a `"user"` message with `WRAP_UP_DIRECTIVE`, calls `client.call(tools=[], max_output_tokens=WRAP_UP_OUTPUT_TOKENS)`, extracts text, falls back to `fallback_message(reason)` on empty text **or** on `ApiError` (`try`/`except ApiError`) |
+| `fallback_message(reason)` | f-string, same wording |
+| `extract_text(content)` | `"".join(b["text"] for b in content if b["type"] == "text")` |
+| `handle_tool_calls(content)` | adds an `"assistant"` message with the **raw content blocks list** (not text) before dispatching; for each `tool_use` block: print `f"  tool call → {name}({args})"`, `result = self.registry.dispatch(name, args)`, print `f"  tool result → {str(result)[:61]}"` (61 chars — Ruby's `[0..60]` range, not `.slice(0,60)`), then `self.context.add_message("tool_result", str(result), tool_use_id=use_id)` |
+
+Note the print-format details matter for output parity: `puts "  tool call → #{name}(#{args})"` — Ruby interpolates the raw Ruby hash `args` (e.g. `{"path"=>"."}` on modern Ruby, or `{:path=>"."}` if the hash actually has symbol keys — check which). Python printing a dict via f-string gives `{'path': '.'}` — different quote style/braces are an accepted cosmetic deviation (same family as prior string-vs-symbol/list-repr notes), not a functional issue.
+
+## Design decisions (confirmed by precedent, not re-asked this step)
+
+- **Continue the `to_messages` arity fix** from step 3 — every backend keeps
+  the uniform `to_messages(system, messages)` signature; `PromptBuilder`
+  keeps calling it that way. Ruby's `agent.rb`/`prompt_builder.rb` at this
+  step still has the original 1-arg-call bug in `PromptBuilder#to_messages`
+  (never fixed upstream) — irrelevant either way since `Agent` never calls
+  `builder.to_messages()` directly, only `to_api_payload`/`parse_response`.
+- **`LoopError` ports as an unused exception class**, exactly matching
+  Ruby's current (dormant) state — don't invent a place to raise it.
+- **`requests`-based `Client`** (step 4 decision) just grows a `tools:`
+  passthrough parameter; retry/backoff logic is untouched.
+
+## Target files to create
+
+```
+week1_baseline/python/05_agent_loop/
+  lib/boukensha/__init__.py         # + agent
+  lib/boukensha/config.py           # copied verbatim from python/04_api_client
+  lib/boukensha/context.py          # copied verbatim
+  lib/boukensha/message.py          # copied verbatim
+  lib/boukensha/tool.py             # copied verbatim
+  lib/boukensha/registry.py         # copied verbatim
+  lib/boukensha/errors.py           # + LoopError
+  lib/boukensha/prompt_builder.py   # + tools: passthrough, parse_response
+  lib/boukensha/client.py           # + tools: passthrough
+  lib/boukensha/agent.py            # NEW — the loop
+  lib/boukensha/tasks/__init__.py
+  lib/boukensha/tasks/base.py       # + max_iterations, max_output_tokens, integer_setting
+  lib/boukensha/tasks/player.py     # copied verbatim
+  lib/boukensha/backends/__init__.py    # copied verbatim
+  lib/boukensha/backends/base.py        # copied verbatim
+  lib/boukensha/backends/anthropic.py   # + tools: passthrough, parse_response
+  lib/boukensha/backends/gemini.py      # + tools: passthrough, parse_response, assistant_parts
+  lib/boukensha/backends/ollama.py      # + tools: passthrough, parse_response, assistant_message
+  lib/boukensha/backends/ollama_cloud.py # + tools: passthrough, parse_response, assistant_message
+  lib/boukensha/backends/openai.py      # + tools: passthrough, parse_response, assistant_message
+  prompts/system.md                 # copied verbatim from python/04_api_client
+  examples/example.py               # same shape/output as example.rb — real multi-turn agent loop
+  requirements.txt                  # python-dotenv, PyYAML, requests (unchanged from step 4)
+  requirements-lock.txt             # pinned via pip freeze
+  README.md                         # adapted from Ruby README, documents the normalized-shape design and the (unused) LoopError
+
+week1_baseline/python/bin/05_agent_loop   # not executable
+week1_baseline/bin/python/05_agent_loop   # executable
+```
+
+## Porting notes / gotchas to handle deliberately
+
+1. **`tools:` sentinel semantics**: `None` means "backend should build tools
+   from `context.tools`"; an explicit value (including `[]`) means "use
+   exactly this, don't regenerate." Every backend's `to_payload` must do
+   `self.to_tools(context.tools) if tools is None else tools` — not
+   `if not tools` (which would incorrectly treat `[]` the same as `None`).
+2. **OpenAI's `parse_response` JSON-decodes `function.arguments`** (a JSON
+   *string* on the wire) into a dict for the normalized `input` field, and
+   its `assistant_message` re-encodes it back to a JSON string
+   (`json.dumps(b["input"])`) when rebuilding the replay message — the only
+   backend that round-trips through a JSON string mid-flight. Ollama/
+   OllamaCloud pass `arguments` as a native dict both ways (no
+   JSON string step) — don't accidentally copy OpenAI's `json.dumps` step
+   into the Ollama backends.
+3. **ID reuse for callless backends**: Ollama, OllamaCloud, and Gemini don't
+   assign tool-call ids — reuse the function/tool **name** as both `id` and
+   `name` in the normalized `tool_use` block (`fn["name"]` doubles for both
+   fields). Anthropic and OpenAI have real ids from the API — use them.
+4. **`example.py`'s tool base directory** is the *step root*
+   (`05_agent_loop/`, i.e. `examples/..`), not the `examples/` directory
+   itself — `base_dir = Path(__file__).resolve().parent.parent`. `read_file`
+   resolves `path` relative to that; `list_directory` lists it, filters
+   dotfiles, and joins with `", "` (comma-space — **different** from step
+   4's `"\n"`-joined `list_directory`, don't copy that step's join
+   character forward).
+5. **Two different `[0..N]`-style slices remain in play**: `handle_tool_calls`'s
+   `result.to_s[0..60]` is a 61-char Ruby range slice → Python `[:61]`
+   (same pattern as step 1's `Message`/`Tool` `__str__`, not step 0's
+   length-based `.slice(0, 60)` → `[:60]`). Keep the two conventions
+   straight per call site.
+6. **`Integer(value)` → `int(value)`** for `integer_setting` — close enough
+   parity for this fixture (current `settings.yaml` doesn't set
+   `max_iterations`/`max_output_tokens` at all, so both fall back to the
+   `DEFAULT_*` constants; only exercised if you add those keys).
+7. **`hasattr` check mirrors `respond_to?`**: `resolve_max_iterations`/
+   `resolve_max_output_tokens` check
+   `task_settings and hasattr(self.context.task, "max_iterations")` before
+   calling it — in practice always true for a real `Task` subclass, but
+   port the guard faithfully since `Agent` doesn't assume its caller always
+   passes a well-formed task.
+8. **Path depth for `BOUKENSHA_DIR` override** in `example.py`: same nesting
+   depth as prior steps — reuse the verified
+   `Path(__file__).resolve().parents[4]` pattern.
+9. **Live output will differ from the Ruby README's sample transcript** —
+   not just because it's a live model call (as in step 4), but because the
+   Python port's `05_agent_loop/` directory has more entries than Ruby's
+   (`.venv/`, `requirements.txt`, `requirements-lock.txt`, `__init__.py`
+   files, etc.), so `list_directory` may return a different/longer listing
+   than Ruby's sample `"README.md, examples, lib"`. This is expected, not a
+   bug — note it in the Python README rather than trying to make the
+   directory contents match Ruby's.
+
+## Acceptance criteria
+
+- `./week1_baseline/bin/python/05_agent_loop` runs against the same shared
+  `.boukensha/` fixture directory, runs the real multi-turn loop against the
+  live Anthropic API, prints `Config:`/`Provider:`/`Model:`/`Max iterations:`/
+  `Max output tokens:` followed by iteration-by-iteration tool-call/tool-result
+  lines and a final `=== FINAL RESPONSE ===` section — matching `example.rb`'s
+  output shape (exact content varies since it's a live model call).
+- The loop correctly stores the assistant's tool_use content **before** the
+  corresponding tool_result message (order matters for Anthropic's API to
+  accept the request) — verify this doesn't raise a 400 from the live API.
+- `Agent.run` returns a non-empty string in the success path; if
+  `max_iterations` were hit (not expected for this simple task, but should
+  work if forced), the wrap-up call returns a `fallback_message`-shaped
+  string on `ApiError`, or the model's own wind-down text otherwise.
+- `week1_baseline/python/05_agent_loop/README.md` documents the normalized
+  response shape, the per-backend tool-call-id table, the `tools:` sentinel
+  semantics, and notes both the dormant `LoopError` and the real-network/
+  live-loop caveat.
+- No behavior invented beyond what the Ruby reference files above define.
