@@ -1,0 +1,279 @@
+# Python Port Plan — Step 06: The Logger
+
+## Goal
+
+Port `week1_baseline/ruby/06_the_logger` to
+`week1_baseline/python/06_the_logger`. This step adds `Boukensha::Logger` —
+a file logger that writes one structured JSON-Lines file per agent session
+to `.boukensha/sessions/<session-id>.jsonl` — and wires `Agent` to call it
+at every phase (iteration, prompt, tool_call, tool_result, response,
+turn_end, and raw provider responses when debug mode is on) instead of
+`puts`-ing directly to the console. Also adds module-level global state on
+the `Boukensha` module itself (a memoized `Config` singleton, a dormant
+`quiet`/`loud` toggle, and a `debug` toggle that actually gates the logger's
+`raw` event), and makes tool-dispatch errors non-fatal — `Agent` now
+rescues exceptions from `Registry#dispatch` and feeds an `"ERROR: ..."`
+string back to the model as the tool result instead of crashing the loop.
+
+**⚠️ Same safety profile as step 5.** `example.py` still runs a real,
+multi-turn agentic loop against the live Anthropic API. New this step: it
+also writes a real JSONL file into the **shared** `.boukensha/sessions/`
+directory (used by both Ruby and Python runs — confirmed a Ruby-generated
+session file, `.boukensha/sessions/20260726T180811Z-0a3d6b44.jsonl`, is
+already committed in this repo from an earlier Ruby test run, in commit
+`b92eefa`). Running the Python example will add a new file there too.
+
+## Reference files (Ruby source of truth)
+
+Read/port from these exact files — do not invent new behavior beyond what they define:
+
+| Ruby file | What it defines |
+|---|---|
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/message.rb` | Byte-identical to `05_agent_loop`'s `Message` |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/tool.rb` | Byte-identical to `05_agent_loop`'s `Tool` |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/registry.rb` | Byte-identical to `05_agent_loop`'s `Registry` |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/client.rb` | Byte-identical to `05_agent_loop`'s `Client` |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/tasks/base.rb` | Byte-identical to `05_agent_loop`'s `Tasks::Base` |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/tasks/player.rb` | Byte-identical to `05_agent_loop`'s `Tasks::Player` |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/backends/{base,anthropic,gemini,ollama,ollama_cloud,openai}.rb` | Byte-identical to `05_agent_loop`'s versions |
+| `week1_baseline/ruby/06_the_logger/Gemfile` | Unchanged: `dotenv` only |
+| `week1_baseline/ruby/06_the_logger/prompts/system.md` | Byte-identical content to `05_agent_loop`'s |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/context.rb` | **Whitespace-only diff** (attr alignment) — no functional change |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/config.rb` | **Changed**: `mud_host`/`mud_port`/`mud_username`/`mud_password` **removed entirely** — confirmed via `grep` that nothing anywhere in this step references them anymore (dead scaffolding cleaned up). `PROMPTS_DIR` still has the same off-by-one bug we fixed in step 4 (`"../../../prompts"`, 3 levels up, resolves outside the step dir) — continue reusing our already-fixed `config.py`. |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/errors.rb` | **Changed**: `LoopError` **removed entirely** (it was already fully dormant — never raised, and unlike step 5 it's not even mentioned in this step's README anymore) |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/prompt_builder.rb` | **Changed**: adds `attr_reader :backend` — no change needed in Python, `backend` was already a plain public attribute in our port |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/logger.rb` | **New** — see "Logger translation" below |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha/agent.rb` | **Changed**: constructor gains `logger: Logger.new` (a **fresh** logger per agent, not a shared default — Ruby re-evaluates default-argument expressions per call); every `puts`/direct console write is replaced with a `@logger.*` call; `handle_tool_calls` now wraps `@registry.dispatch` in `begin/rescue StandardError` and logs+continues instead of propagating the exception |
+| `week1_baseline/ruby/06_the_logger/lib/boukensha.rb` | Adds a **module-level singleton** reopening `Boukensha` itself: `@quiet`, `@debug`, `@config` state with `self.config`/`self.quiet!`/`self.loud!`/`self.quiet?`/`self.debug!`/`self.debug?` — defined *before* `require_relative "boukensha/logger"` so `Logger` can reference `Boukensha.debug?`/`Boukensha.config` at call time. Confirmed via `grep`: `quiet!`/`loud!`/`quiet?` are declared but **never called anywhere** (not even mentioned in the README) — fully dormant, unlike `debug!`/`debug?`/`config` which are genuinely used (`Logger#raw` checks `Boukensha.debug?`; `Logger#default_dir` reads `Boukensha.config.dir`). |
+| `week1_baseline/ruby/06_the_logger/examples/example.rb` | Same tool/message setup as step 5's example, but now builds `logger = Boukensha::Logger.new` and passes it to `Agent.new(..., logger: logger)`. Per-iteration/tool-call console output is **gone** — `example.rb` only prints the header block and the final response; all turn-by-turn detail now goes to the JSONL file instead. |
+| `week1_baseline/ruby/06_the_logger/README.md` | Session log location/format, Logger API table (again slightly stale vs. real signatures — see gotcha below), task config recap, `Boukensha.debug!` usage |
+| `week1_baseline/ruby/bin/06_the_logger` | Per-language wrapper (not executable, same convention as prior steps) |
+| `week1_baseline/bin/ruby/06_the_logger` | Top-level dispatcher (executable, same convention as prior steps) |
+
+Confirmed via diff: `message.rb`, `tool.rb`, `registry.rb`, `client.rb`,
+`tasks/base.rb`, `tasks/player.rb`, all 5 backend files, `Gemfile`, and
+`prompts/system.md` are byte-identical to `05_agent_loop`'s versions. No
+`python/06_the_logger`, `python/bin/06_the_logger`, or
+`bin/python/06_the_logger` exist yet.
+
+I also read an actual Ruby-generated session log
+(`.boukensha/sessions/20260726T180811Z-0a3d6b44.jsonl`, committed in this
+repo) to confirm the exact real field order/shape for every phase — this is
+more reliable than the README's prose, which (same recurring pattern as
+every prior step) documents a slightly different, stale method-signature
+table (e.g. lists `prompt(messages:, tools:, budget:)` — the real method has
+no `budget:` param; lists `tool_result(name:, result:)` — the real method
+also has `ok:`/`error:`). The Python README documents the real signatures
+and the real observed JSONL shape.
+
+## Conventions inherited from prior steps (not re-litigated here)
+
+- Python 3.11+, type hints throughout, literal 1:1 class mirror.
+- String-only dict keys, `to_messages(system, messages)` uniform signature, `model_info_for` naming, `requests`-based `Client`, `@property` for no-arg instance accessors.
+- Bare `lib/` + `sys.path` manipulation, per-step `requirements.txt`/`requirements-lock.txt` + own `.venv`, no automated tests yet, bin wrapper executable-bit convention.
+
+## Reuse: copy verbatim from `python/05_agent_loop`
+
+`context.py`, `message.py`, `tool.py`, `registry.py`, `client.py`,
+`prompt_builder.py`, `tasks/player.py`, `tasks/base.py`,
+`backends/{__init__,base,anthropic,gemini,ollama,ollama_cloud,openai}.py`,
+`prompts/system.md`. `config.py` and `errors.py` need small edits (below),
+not verbatim reuse.
+
+## Design decisions (confirmed with user)
+
+- **Module-level global toggle naming.** Ruby's bang/question-mark methods
+  (`quiet!`/`quiet?`, `debug!`/`debug?`) can't be flattened to the same
+  Python identifier twice. Confirmed naming:
+  - `Boukensha.config` → `config()`
+  - `Boukensha.quiet!` → `enable_quiet()` (dormant, ported anyway)
+  - `Boukensha.loud!` → `disable_quiet()` (dormant, ported anyway)
+  - `Boukensha.quiet?` → `is_quiet()` (dormant, ported anyway)
+  - `Boukensha.debug!` → `enable_debug()`
+  - `Boukensha.debug?` → `is_debug()`
+- **New internal module `lib/boukensha/_state.py`** (no Ruby equivalent
+  file) holds this global state (`_quiet`, `_debug`, `_config` module
+  globals + the 6 functions above). Ruby can reopen `boukensha.rb` and
+  define this inline because `logger.rb` calls `Boukensha.debug?` as a
+  runtime module-method lookup with no import-time dependency. Python
+  submodules importing from the package's own `__init__.py` while
+  `__init__.py` is still executing is fragile (order-dependent circular
+  import). Putting the state in a small leaf module that both `_state.py`
+  consumers (`logger.py`) and `__init__.py` (for re-export, so
+  `boukensha.enable_debug()` works the same way `Boukensha.debug!` does)
+  import from independently avoids that fragility entirely. This is a
+  structural (not behavioral) deviation — same public surface, safer
+  Python module wiring.
+- **Tool-dispatch error handling.** Ruby's `rescue StandardError => e` →
+  Python `except Exception as e:` (Python's closest analog — excludes
+  `BaseException`-level control-flow signals like `SystemExit`/
+  `KeyboardInterrupt`, matching Ruby's `StandardError` excluding things
+  like `SignalException`). Result becomes `f"ERROR: {type(e).__name__}: {e}"`,
+  logged with `ok=False, error=str(e)`.
+
+## Logger translation (`lib/boukensha/logger.py`)
+
+| Ruby | Python |
+|---|---|
+| `DEFAULT_SESSION_DIR = "sessions"` | class attr, same value |
+| `initialize(session_id: nil, dir: nil, log: nil, snapshot: {})` | `__init__(self, *, session_id=None, dir=None, log=None, snapshot=None)` — `snapshot or {}` inside body (mutable-default avoidance, same convention as `Registry.tool`) |
+| `@session_id = session_id || generate_session_id` | `self.session_id = session_id or self._generate_session_id()` |
+| `@path = log || File.join(dir || default_dir, "#{@session_id}.jsonl")` | `self.path = log or str(Path(dir or self._default_dir()) / f"{self.session_id}.jsonl")` |
+| `FileUtils.mkdir_p(File.dirname(@path))` | `Path(self.path).parent.mkdir(parents=True, exist_ok=True)` |
+| `@log_io = File.open(@path, "a")` | `self._log_io = open(self.path, "a")` |
+| `write_log({phase: "session_start"}.merge(snapshot))` | `self._write_log({"phase": "session_start", **(snapshot or {})})` — snapshot keys override `phase` on conflict, matching Ruby's `.merge` |
+| `iteration(n:, max:)` | `iteration(self, *, n, max)` |
+| `limit_reached(kind:, n:, max:)` | `limit_reached(self, *, kind, n, max)` |
+| `turn_end(reason:, iterations:, tokens: nil)` | `turn_end(self, *, reason, iterations, tokens=None)` |
+| `prompt(messages:, tools:)` | `prompt(self, *, messages, tools)` → `message_count=len(messages)`, `messages=[serialize(m) for m in messages]`, `tool_count=len(tools)`, `tools=list(tools.keys())` |
+| `tool_call(name:, args:)` | `tool_call(self, *, name, args)` |
+| `tool_result(name:, result:, ok: true, error: nil)` | `tool_result(self, *, name, result, ok=True, error=None)` — `result=str(result)` |
+| `response(text:, usage: nil, stop_reason: nil, task: nil, backend: nil)` | `response(self, *, text, usage=None, stop_reason=None, task=None, backend=None)` — merges `{"phase": "response", "text": str(text).strip(), "usage": usage, "stop_reason": stop_reason}` with `self._execution_metadata(...)` |
+| `raw(data:)` — `return unless Boukensha.debug?` | `raw(self, *, data)` — `if not is_debug(): return` (imported from `._state`) |
+| `close` | `close(self)` — `self._log_io.close()` |
+| `default_dir` (private) | `_default_dir(self)` — `str(Path(config().dir) / self.DEFAULT_SESSION_DIR)` (imports `config` from `._state`) |
+| `write_log(event)` (private) | `_write_log(self, event)` — `json.dumps({**event, "session_id": self.session_id, "at": self._now_iso()})`, write + `"\n"`, then flush |
+| `generate_session_id` (private) | `_generate_session_id(self)` — `f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(4)}"` |
+| `serialize_message(msg)` (private) | `_serialize_message(self, msg)` — `{"role": msg.role, "content": msg.content}` |
+| `execution_metadata(task:, backend:, usage:)` (private) | `_execution_metadata(self, *, task, backend, usage)` — early return `{}` if all three are falsy; builds the metadata dict then drops `None`-valued keys (`.compact` → dict comprehension filtering `v is not None`) |
+| `task_name(task)` (private) | `_task_name(self, task)` — `None if task is None else (task.task_name() if hasattr(task, "task_name") else str(task))` |
+| `provider_name(backend)` (private) | `_provider_name(self, backend)` — `None if backend is None else re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", type(backend).__name__).lower()` — **note**: this produces `"open_ai"` for the OpenAI backend (not `"openai"`), a real quirk of Ruby's own regex-based class-name-to-snake_case conversion (`"OpenAI"` has a lowercase-then-two-uppercase transition at `nA`→`n_A`, giving `Open_AI`→`open_ai`); every other backend name converts cleanly (`Anthropic`→`anthropic`, `Gemini`→`gemini`, `Ollama`→`ollama`, `OllamaCloud`→`ollama_cloud`). Port this quirk faithfully — it's cosmetic (log-field-only) and not worth "fixing" since it'd diverge from Ruby's real output. |
+| `usage_tokens(usage)` (private) | `_usage_tokens(self, usage)` — tries `input_tokens`/`prompt_tokens`/`promptTokenCount`/`prompt_eval_count` for input, `output_tokens`/`completion_tokens`/`candidatesTokenCount`/`eval_count` for output |
+| `first_integer(hash, *keys)` (private) | `_first_integer(self, data, *keys)` — string-keyed-only lookup (`data.get(key)`), no symbol-fallback needed (already-established string-only-keys simplification); `int(value)` wrapped in `try/except (ValueError, TypeError): return None` |
+| `estimate_cost(backend, tokens)` (private) | `_estimate_cost(self, backend, tokens)` — `None` unless `backend` has `estimate_cost` and both token counts are present |
+
+Confirmed exact real JSONL shape (from the committed Ruby session log) for
+each phase, useful as a literal reference when testing the Python port:
+`session_start` → `{phase, session_id, at}`; `iteration` → `{phase, n, max,
+session_id, at}`; `prompt` → `{phase, message_count, messages, tool_count,
+tools, session_id, at}`; `response` → `{phase, text, usage, stop_reason,
+task, provider, model, usage_unit, input_tokens, output_tokens, cost_usd,
+session_id, at}` (note `usage_level` is absent for Anthropic since it's
+`None` and gets `.compact`-ed away); `tool_call` → `{phase, name, args,
+session_id, at}`; `tool_result` → `{phase, name, result, ok, error,
+session_id, at}`; `turn_end` → `{phase, reason, iterations, tokens,
+session_id, at}` (`tokens` is always `null` — `Agent` never actually passes
+it).
+
+## Agent translation updates (on top of step 5's `agent.py`)
+
+- Constructor: add `logger: Any = None` kwarg-only param; inside `__init__`,
+  `self.logger = logger if logger is not None else Logger()` (**not**
+  `logger: Any = Logger()` in the signature — that would create one shared
+  `Logger` instance reused by every `Agent` built without an explicit
+  logger, opening one shared file handle for all of them; Ruby's
+  `logger: Logger.new` default is re-evaluated fresh on every call, so
+  Python must replicate that with the "default `None`, construct inside the
+  body" idiom already used elsewhere in this port).
+- `run()`: log `iteration`/`prompt` before each API call, `raw` right after
+  getting the response, and `turn_end` on the non-tool-use exit path (after
+  computing `text` and calling `self._log_response`).
+- `_iteration_limit_reached()` path now also calls
+  `self.logger.limit_reached(kind="max_iterations", n=self.iteration, max=self.max_iterations)`
+  before `self._wrap_up(...)`.
+- `_wrap_up`: logs `response` + `turn_end` on the success path; on
+  `ApiError`, still logs `turn_end` before returning the fallback message.
+- `_handle_tool_calls(content, response)`: now takes the raw `response`
+  too (needed for `_log_response`); computes `tool_calls` up front, logs a
+  `response` event with either the model's own reasoning text or a
+  synthesized `f"(tool use — {n} call{'s' if n != 1 else ''})"` placeholder
+  when the model gave no text; wraps `self.registry.dispatch(name, args)`
+  in `try/except Exception` to turn tool crashes into a logged, non-fatal
+  `"ERROR: ..."` tool result instead of propagating.
+- New private `_log_response(text, response)` and `_normalized_usage(response)`
+  helpers, mirroring Ruby's `log_response`/`normalized_usage`.
+
+## Target files to create
+
+```
+week1_baseline/python/06_the_logger/
+  lib/boukensha/__init__.py         # re-exports _state functions + Logger + updated Agent
+  lib/boukensha/_state.py           # NEW (Python-only) — quiet/debug/config module globals
+  lib/boukensha/config.py           # copied from python/05_agent_loop, minus mud_* methods
+  lib/boukensha/context.py          # copied verbatim
+  lib/boukensha/message.py          # copied verbatim
+  lib/boukensha/tool.py             # copied verbatim
+  lib/boukensha/registry.py         # copied verbatim
+  lib/boukensha/client.py           # copied verbatim
+  lib/boukensha/errors.py           # copied from python/05_agent_loop, minus LoopError
+  lib/boukensha/prompt_builder.py   # copied verbatim (backend already public)
+  lib/boukensha/logger.py           # NEW
+  lib/boukensha/agent.py            # updated per above
+  lib/boukensha/tasks/__init__.py
+  lib/boukensha/tasks/base.py       # copied verbatim
+  lib/boukensha/tasks/player.py     # copied verbatim
+  lib/boukensha/backends/__init__.py    # copied verbatim
+  lib/boukensha/backends/base.py        # copied verbatim
+  lib/boukensha/backends/anthropic.py   # copied verbatim
+  lib/boukensha/backends/gemini.py      # copied verbatim
+  lib/boukensha/backends/ollama.py      # copied verbatim
+  lib/boukensha/backends/ollama_cloud.py # copied verbatim
+  lib/boukensha/backends/openai.py      # copied verbatim
+  prompts/system.md                 # copied verbatim
+  examples/example.py               # same shape/output as example.rb — no per-iteration console prints
+  requirements.txt                  # python-dotenv, PyYAML, requests (unchanged)
+  requirements-lock.txt             # pinned via pip freeze
+  README.md                         # adapted from Ruby README, documents real Logger method signatures + _state design
+
+week1_baseline/python/bin/06_the_logger   # not executable
+week1_baseline/bin/python/06_the_logger   # executable
+```
+
+## Porting notes / gotchas to handle deliberately
+
+1. **Fresh `Logger()` per `Agent`, not a shared default** — see Agent
+   translation above; this is the single easiest thing to get wrong.
+2. **`_state.py`'s `config()` lazily constructs its own `Config()`**,
+   independent of whatever `Config` instance `example.py`'s own top-level
+   `config = Config()` created — both resolve to the same directory (since
+   `BOUKENSHA_DIR` is set as a process env var before either is
+   constructed), but they are two separate Python objects, matching Ruby's
+   two separate `Config.new` instances exactly.
+3. **`Logger.raw` is gated on `is_debug()`**, which defaults to `False` —
+   without calling `enable_debug()` first, raw provider responses are never
+   logged. Match this default exactly (don't default debug to on).
+4. **JSONL write must flush after every line** (`self._log_io.flush()`
+   after each write) so `tail -f`/inspection during a run sees live data,
+   matching Ruby's explicit `.flush`.
+5. **`turn_end`'s `tokens` field is always logged as `null`** — `Agent`
+   never actually passes a `tokens=` value to `turn_end`, only `reason=`/
+   `iterations=`. Don't "fix" this into something more useful; it's real
+   (if slightly vestigial) Ruby behavior.
+6. **`provider_name`'s `"open_ai"` quirk** (see Logger translation table) —
+   deliberately kept, not a bug to fix.
+7. **`.boukensha/sessions/` is shared, real, and not gitignored** — running
+   the ported example writes a real file there (a Ruby session log is
+   already committed at `.boukensha/sessions/20260726T180811Z-0a3d6b44.jsonl`
+   from commit `b92eefa`). Don't add a `.gitignore` entry unilaterally;
+   that's a call for the user to make, not implied by this port.
+8. **Path depth for `BOUKENSHA_DIR` override** in `example.py`: same as all
+   prior steps — `Path(__file__).resolve().parents[4]`.
+9. **`config.py`'s `PROMPTS_DIR` bug-fix continues** — this step's Ruby
+   `config.rb` still has the same 3-levels-up bug from step 4 onward;
+   Python keeps computing it correctly (2 levels up), per the fix already
+   established and confirmed in the step-4 plan.
+
+## Acceptance criteria
+
+- `./week1_baseline/bin/python/06_the_logger` runs the same live multi-turn
+  loop as step 5, but prints only the header block and final response to
+  the console (no per-iteration/tool-call lines) — all turn detail lands in
+  a new `.boukensha/sessions/<session-id>.jsonl` file.
+- The written JSONL file's phases/fields match the real Ruby-generated
+  sample referenced above: `session_start`, `iteration`, `prompt`,
+  `response` (with `task`/`provider`/`model`/`usage_unit`/`input_tokens`/
+  `output_tokens`/`cost_usd` when resolvable), `tool_call`, `tool_result`
+  (with `ok`/`error`), `turn_end`.
+- A tool that raises an exception produces a `tool_result` line with
+  `"ok": false` and an `"ERROR: ..."`-prefixed result, and the loop
+  continues rather than crashing (verify with a deliberately-broken tool in
+  an offline test, not necessarily via the live example).
+- `enable_debug()` causes a `raw` phase line containing the full provider
+  response to appear in the JSONL file; without calling it, no `raw` line
+  appears.
+- `week1_baseline/python/06_the_logger/README.md` documents the real
+  Logger method signatures (not the Ruby README's slightly-stale table),
+  the JSONL phase shapes, the `_state.py` design rationale, and the
+  `enable_quiet()`/`disable_quiet()`/`is_quiet()` dormant-toggle note.
+- No behavior invented beyond what the Ruby reference files above define,
+  except the explicitly confirmed naming/structural deviations above.
