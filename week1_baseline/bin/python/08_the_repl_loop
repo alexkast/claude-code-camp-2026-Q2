@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+cd "$(dirname "$0")/../../python/08_the_repl_loop"
+./.venv/bin/python examples/example.py
