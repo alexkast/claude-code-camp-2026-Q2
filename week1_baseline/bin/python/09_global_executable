@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+cd "$(dirname "$0")/../../python/09_global_executable"
+./.venv/bin/boukensha

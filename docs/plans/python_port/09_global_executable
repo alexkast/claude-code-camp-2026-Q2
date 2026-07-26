@@ -1,0 +1,286 @@
+# Python Port Plan — Step 09: Global Executable
+
+## Goal
+
+Port `week1_baseline/ruby/09_global_executable` to
+`week1_baseline/python/09_global_executable`. Ruby's version packages
+BOUKENSHA as a RubyGem (`boukensha.gemspec` + `bin/boukensha`) so
+`gem install` puts a global `boukensha` command on `$PATH`. The command's
+actual logic is `lib/boukensha_loader.rb`: it resolves *which step's*
+`lib/boukensha.rb` to load (via `BOUKENSHA_PATH` env var → `~/.boukensharc`
+file → the step bundled inside the gem, in that priority order), then boots
+`Boukensha.repl` from whichever step it found.
+
+**Per your confirmed decision, this gets a full-parity port**: a
+`pyproject.toml` with a `console_scripts` entry point, so
+`pip install -e .` gives a real global `boukensha` command — the first step
+in this port to introduce Python packaging (every prior step deliberately
+used bare `lib/` + `sys.path`, per the `00_config` decision). The loader
+logic (`boukensha_loader.py`) replicates the `BOUKENSHA_PATH`/
+`~/.boukensharc`/bundled-default resolution chain.
+
+**Also per your confirmed decision**: this step's Ruby source reverts two
+step-8 improvements without explanation — `config.rb`'s 3-tier directory
+resolution (CWD `.boukensha/` lookup) is gone, back to 2-tier; `client.rb`'s
+friendlier 401 message is gone; the REPL banner loses its ✓/✗
+API-key-status line, back to a plain `config:`/`provider:`/`model:`
+display. The Python port **reproduces these reversions exactly**, matching
+the real Ruby source rather than "fixing" what looks like an authoring
+slip.
+
+## Reference files (Ruby source of truth)
+
+| Ruby file | What it defines |
+|---|---|
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/agent.rb` | Byte-identical to `08_the_repl_loop`'s `Agent` |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/context.rb` | Byte-identical to `08_the_repl_loop`'s `Context` |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/run_dsl.rb` | Byte-identical to `08_the_repl_loop`'s `RunDSL` |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/logger.rb` | Byte-identical to `08_the_repl_loop`'s `Logger` |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/message.rb`, `tool.rb`, `registry.rb`, `prompt_builder.rb`, `errors.rb`, `tasks/base.rb`, `tasks/player.rb`, `backends/*.rb` | All byte-identical to `08_the_repl_loop`'s versions |
+| `week1_baseline/ruby/09_global_executable/prompts/system.md` | Byte-identical content to `08_the_repl_loop`'s |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/config.rb` | **Reverted**: `resolve_dir` is back to 2-tier (`BOUKENSHA_DIR` env var → `~/.boukensha`) — the step-8 CWD-`.boukensha/` lookup is gone. `mud_*` accessors are still present, unchanged. |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/client.rb` | **Reverted**: the friendlier 401 message from step 8 is gone — back to the generic `"API request failed after N attempts (401): <body>"` for every non-2xx status, including 401. |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/repl.rb` | **Reverted**: `banner` no longer computes API-key ✓/✗ status or a `config_exists` check — just `config:`/`provider:`/`model:` lines showing the raw value or `"(default)"`. Confirmed via diff: only the `banner` method changed, `run_turn`/`HELP`/`start` are untouched. |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha/version.rb` | **Changed**: `VERSION = "0.9.0"` (was `"0.8.0"`) |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha.rb` | **Changed**: only `repl`'s doc-comment wording changed (still describes the same behavior); implementation bodies of `run`/`repl` are otherwise unchanged from step 8. |
+| `week1_baseline/ruby/09_global_executable/lib/boukensha_loader.rb` | **New**: `BoukenshaLoader.resolve` (env var → rc file → bundled default, aborting with a helpful message if a configured path doesn't contain `lib/boukensha.rb`) and `.load_and_start_repl` (requires the resolved lib, checks `Boukensha.respond_to?(:repl)`, calls `Boukensha.repl`) |
+| `week1_baseline/ruby/09_global_executable/bin/boukensha` | **New**: a 3-line shebang script — adds `../lib` to `$LOAD_PATH`, requires `boukensha_loader`, calls `BoukenshaLoader.load_and_start_repl` |
+| `week1_baseline/ruby/09_global_executable/boukensha.gemspec` | **New**: RubyGems packaging metadata. Notably **rough**: `spec.files` globs `lib/**/*.rb` + `bin/boukensha` only — **`prompts/system.md` is not included** in the packaged gem at all — and the gemspec's own comment claims "ships no external dependencies" even though `config.rb` requires the (non-stdlib) `dotenv` gem, which isn't declared as a gemspec dependency either. |
+| `week1_baseline/ruby/09_global_executable/Gemfile` | Adds a `gemspec` directive (tells Bundler to also install the gemspec's own declared dependencies — of which there are effectively none, per the gap above) |
+| `week1_baseline/ruby/09_global_executable/README.md` | Install instructions (`gem build` + `gem install`), `BOUKENSHA_PATH`/`~/.boukensharc` priority table, debug mode — same recurring doc-drift pattern: title says "Step 8" (this is step 9), install example says `boukensha-0.1.0.gem` (real version is `0.9.0`), and one example references a nonexistent `06_the_run_dsl` step name (should be `07_the_run_dsl`). |
+| `week1_baseline/ruby/bin/09_global_executable` | **Broken/vestigial**: references `examples/example.rb`, which doesn't exist in this step at all (there's no `examples/` directory) — confirms this step was never meant to be run via the usual per-step wrapper convention; it's install-then-invoke, not run-in-place. No top-level `bin/ruby/09_global_executable` dispatcher exists at all for this step (checked: absent). |
+
+Confirmed via diff: `agent.rb`, `context.rb`, `run_dsl.rb`, `logger.rb`,
+`message.rb`, `tool.rb`, `registry.rb`, `prompt_builder.rb`, `errors.rb`,
+`tasks/base.rb`, `tasks/player.rb`, all 5 backend files, and
+`prompts/system.md` are byte-identical to `08_the_repl_loop`'s versions. No
+`python/09_global_executable` exists yet.
+
+## Conventions inherited from prior steps (not re-litigated here)
+
+- Python 3.11+, type hints throughout, literal 1:1 class mirror.
+- String-only dict keys, `to_messages(system, messages)` uniform signature,
+  `model_info_for` naming, `requests`-based `Client`, `@property` for no-arg
+  instance accessors, `_state.py` for module-level global state.
+- No automated tests yet.
+
+## Reuse: copy verbatim from `python/08_the_repl_loop`
+
+`agent.py`, `context.py`, `run_dsl.py`, `logger.py`, `message.py`, `tool.py`,
+`registry.py`, `prompt_builder.py`, `errors.py`, `_state.py`,
+`tasks/{__init__,base,player}.py`,
+`backends/{__init__,base,anthropic,gemini,ollama,ollama_cloud,openai}.py`,
+`prompts/system.md`. `config.py`, `client.py`, `repl.py`, and `version.py`
+are **not** verbatim reuse — they revert to (or bump, for `version.py`)
+specific prior states, detailed below.
+
+## Design decisions (confirmed with user)
+
+- **Full pip-packaging parity.** Add `pyproject.toml` at
+  `python/09_global_executable/` with a `[project.scripts]` entry
+  (`boukensha = "boukensha_loader:main"`), so `pip install -e .` installs a
+  real `boukensha` command into the active virtualenv's `bin/`. Dependencies
+  declared in `pyproject.toml`: `python-dotenv`, `PyYAML`, `requests` — the
+  actual runtime deps (unlike the Ruby gemspec, which forgets to declare
+  `dotenv`). This is the first step in the Python port to use real packaging
+  instead of bare `sys.path` manipulation.
+- **Reversions reproduced exactly.** `config.py` goes back to 2-tier
+  resolution, `client.py` drops the 401 special case, `repl.py`'s banner
+  drops the API-key status line — matching this step's actual Ruby source,
+  not the "improved" step-8 versions.
+- **`prompts/system.md` packaging gap mirrored, not fixed.** The file stays
+  in the repo at `python/09_global_executable/prompts/system.md` (needed
+  for `PROMPTS_DIR` to resolve correctly under an **editable** install,
+  where source files aren't copied), but `pyproject.toml` does **not**
+  declare it as package data — faithfully mirroring the Ruby gemspec's own
+  `spec.files` omission. Note in the gotchas section: this gap only
+  manifests under a real (non-editable) build+install, not under
+  `pip install -e .`.
+
+## `boukensha_loader.py` design
+
+Ruby's `BoukenshaLoader` does `require main` (loading the resolved step's
+`lib/boukensha.rb` at its real module-level namespace `Boukensha`) then
+checks `Boukensha.respond_to?(:repl)`. Python has no direct equivalent of
+"require an arbitrary file path into a fixed top-level namespace" without
+extra care — a naive `sys.path.insert(0, target_lib_dir); import boukensha`
+risks colliding with **this same package's own editable install**, which
+registers `boukensha` in site-packages metadata (and possibly `sys.path`
+finders) under that exact name. To avoid that ambiguity entirely, load the
+target step's package explicitly via `importlib.util.spec_from_file_location`,
+registering it in `sys.modules["boukensha"]` **before** executing it (so its
+own internal relative imports like `from .config import Config` resolve
+correctly against the target directory, not any other):
+
+```python
+import importlib.util
+import sys
+from pathlib import Path
+
+
+def _load_boukensha_package(lib_dir: Path):
+    init_file = lib_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "boukensha", init_file, submodule_search_locations=[str(lib_dir)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["boukensha"] = module
+    spec.loader.exec_module(module)
+    return module
+```
+
+| Ruby | Python |
+|---|---|
+| `BUNDLED_LIB = File.expand_path("../boukensha.rb", __FILE__)` (sibling `lib/boukensha.rb` next to `lib/boukensha_loader.rb`) | `BUNDLED_LIB = Path(__file__).resolve().parent / "boukensha"` (sibling `lib/boukensha/` package next to `lib/boukensha_loader.py`) |
+| `resolve` — env var, then `~/.boukensharc`, then bundled, aborting with a helpful message if a configured path lacks `lib/boukensha.rb` | Same 3-tier resolution, checking for `lib/boukensha/__init__.py` instead; `sys.exit(message)` in place of Ruby's `abort <<~MSG`, same wording adapted for Python paths |
+| `load_and_start_repl` — `require main`; `abort` if `Boukensha` doesn't `respond_to?(:repl)`; else `Boukensha.repl` | `main()` — resolve the lib dir, `_load_boukensha_package(lib_dir)`, `sys.exit(message)` if `not hasattr(module, "repl")` (message references `python {step_dir}/examples/example.py` instead of `ruby .../examples/*.rb`), else `module.repl()` |
+| `puts "[boukensha] loading from: #{step_dir}" if ENV["BOUKENSHA_DEBUG"]` | `if os.environ.get("BOUKENSHA_DEBUG"): print(f"[boukensha] loading from: {step_dir}")` |
+
+`step_dir` derivation: Ruby's `File.dirname(File.dirname(main))` (main =
+`.../lib/boukensha.rb`, so two `dirname`s reach the step root). Python:
+`lib_dir.parent.parent` where `lib_dir` = `.../lib/boukensha` (same two
+levels: `boukensha` → `lib` → step root).
+
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boukensha"
+version = "0.9.0"
+description = "BOUKENSHA — a tiny teaching framework for coding harnesses"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Andrew Brown", email = "andrew@exampro.co"}]
+dependencies = [
+    "python-dotenv",
+    "PyYAML",
+    "requests",
+]
+
+[project.scripts]
+boukensha = "boukensha_loader:main"
+
+[tool.setuptools]
+package-dir = {"" = "lib"}
+packages = ["boukensha", "boukensha.tasks", "boukensha.backends"]
+py-modules = ["boukensha_loader"]
+```
+
+Version reads as a literal `"0.9.0"` here (Python packaging metadata isn't
+as trivially importable pre-build as Ruby's
+`require_relative "lib/boukensha/version"` inside the gemspec itself) — note
+in the gotchas section as a minor mechanical difference, not a behavior gap:
+keep this string in sync with `lib/boukensha/version.py`'s `VERSION` by hand.
+
+## Target files to create
+
+```
+week1_baseline/python/09_global_executable/
+  pyproject.toml                     # NEW — packaging + console_scripts entry point
+  lib/boukensha_loader.py            # NEW — step-switching loader
+  lib/boukensha/__init__.py          # copied from python/08_the_repl_loop (re-exports unchanged)
+  lib/boukensha/version.py           # VERSION = "0.9.0" (bumped)
+  lib/boukensha/config.py            # reverted to 2-tier _resolve_dir
+  lib/boukensha/client.py            # reverted — no 401 special case
+  lib/boukensha/repl.py              # reverted banner (no ✓/✗ status)
+  lib/boukensha/agent.py             # copied verbatim
+  lib/boukensha/context.py           # copied verbatim
+  lib/boukensha/run_dsl.py           # copied verbatim
+  lib/boukensha/logger.py            # copied verbatim
+  lib/boukensha/message.py           # copied verbatim
+  lib/boukensha/tool.py              # copied verbatim
+  lib/boukensha/registry.py          # copied verbatim
+  lib/boukensha/prompt_builder.py    # copied verbatim
+  lib/boukensha/errors.py            # copied verbatim
+  lib/boukensha/_state.py            # copied verbatim
+  lib/boukensha/tasks/__init__.py    # copied verbatim
+  lib/boukensha/tasks/base.py        # copied verbatim
+  lib/boukensha/tasks/player.py      # copied verbatim
+  lib/boukensha/backends/__init__.py    # copied verbatim
+  lib/boukensha/backends/base.py        # copied verbatim
+  lib/boukensha/backends/anthropic.py   # copied verbatim
+  lib/boukensha/backends/gemini.py      # copied verbatim
+  lib/boukensha/backends/ollama.py      # copied verbatim
+  lib/boukensha/backends/ollama_cloud.py # copied verbatim
+  lib/boukensha/backends/openai.py      # copied verbatim
+  prompts/system.md                  # copied verbatim (present in-repo; not declared as packaged data, mirroring Ruby's gemspec gap)
+  README.md                          # adapted — pip install -e ., BOUKENSHA_PATH/~/.boukensharc, the reversions, the packaging gap, no examples/ (matching Ruby)
+
+week1_baseline/python/bin/09_global_executable   # not executable — invokes ./.venv/bin/boukensha
+week1_baseline/bin/python/09_global_executable   # NEW — no Ruby equivalent exists for this step (bin/ruby/09_global_executable is absent entirely); added anyway for consistency with every other step's top-level dispatcher convention, executable per that convention
+```
+
+No `requirements.txt`/`requirements-lock.txt` this step — `pyproject.toml`
+is the single dependency manifest, a deliberate step-specific convention
+change now that real packaging is in play.
+
+## Porting notes / gotchas to handle deliberately
+
+1. **Import-collision risk with the bundled package's own editable install**
+   is the trickiest part of this step — see the `importlib.util` design
+   above. Test explicitly by pointing `BOUKENSHA_PATH` at an *earlier*
+   step (e.g. `python/04_api_client`) and confirming the loader actually
+   boots that step's code, not silently falling back to the bundled
+   `09_global_executable` package of the same name.
+2. **`prompts/system.md`'s packaging gap only manifests under a real build**
+   (`python -m build` + `pip install dist/*.whl`), not under
+   `pip install -e .` (editable installs don't copy files — `Config.PROMPTS_DIR`'s
+   `Path(__file__).resolve().parent.parent.parent / "prompts"` computation
+   still finds the real file in the source tree). If you want to actually
+   observe the gap Ruby has, test with a real (non-editable) install; for
+   day-to-day development, editable install is expected and sidesteps it.
+3. **`step_dir` must be computed the same way in both the "resolve" and
+   "debug print"/"error message" code paths** — two `.parent` calls from
+   `lib_dir` (`.../lib/boukensha` → `.../lib` → step root), matching Ruby's
+   two `File.dirname` calls.
+4. **The three reversions are deliberate fidelity, not oversights** — don't
+   "helpfully" restore step 8's 3-tier config resolution, the 401 message,
+   or the banner's API-key status while porting `config.py`/`client.py`/
+   `repl.py` for this step. Copy `08_the_repl_loop`'s versions of these
+   three files as the *starting point*, then apply the specific reversions
+   described above — don't copy `00_config`'s or `07_the_run_dsl`'s older
+   versions wholesale, since other unrelated fixes from steps 4–8 (e.g. the
+   `PROMPTS_DIR` bug fix, `isinstance(settings, dict)` guard) must stay.
+5. **No `examples/` directory this step** — matching Ruby exactly (and its
+   own broken `bin/09_global_executable` wrapper that references a
+   nonexistent `examples/example.rb`). The Python bin wrappers invoke the
+   installed `boukensha` console script instead of `examples/example.py`.
+6. **Per-step `.venv` scoping affects what "global" means here.** Every
+   prior step's `.venv` is isolated; installing `boukensha` via
+   `pip install -e .` inside *this* step's own `.venv` makes it "global"
+   only within that venv's `bin/`, not literally system-wide. This is a
+   reasonable, safe scope for a teaching repo (mirrors testing a gem inside
+   a clean Bundler environment rather than actually running
+   `gem install --user-install` against your real system Ruby) — worth
+   noting in the README so it's not mistaken for a full system-wide install.
+
+## Acceptance criteria
+
+- `python3 -m venv .venv && ./.venv/bin/pip install -e .` succeeds inside
+  `python/09_global_executable/`, and `./.venv/bin/boukensha` boots the
+  bundled REPL (same banner/behavior as `08_the_repl_loop`'s `Repl`, minus
+  the two reverted improvements).
+- `BOUKENSHA_PATH=<repo>/week1_baseline/python/04_api_client ./.venv/bin/boukensha`
+  correctly reports that step doesn't support the REPL (no `repl` function
+  before step 7) with the adapted error message — proving the loader
+  actually switched packages rather than silently using the bundled one.
+- `BOUKENSHA_PATH=<repo>/week1_baseline/python/07_the_run_dsl ./.venv/bin/boukensha`
+  successfully boots that step's REPL instead of the bundled one — the
+  direct test of the import-collision concern in gotcha #1.
+- `~/.boukensharc` pointing at a valid step works when `BOUKENSHA_PATH` is
+  unset; an invalid path in either produces the adapted, Python-flavored
+  error message and a non-zero exit, not a crash/traceback.
+- `BOUKENSHA_DEBUG=1` prints the `[boukensha] loading from: ...` line before
+  the banner.
+- `week1_baseline/python/09_global_executable/README.md` documents
+  `pip install -e .`, the `BOUKENSHA_PATH`/`~/.boukensharc` priority order,
+  the three reproduced reversions, the `prompts/system.md` packaging-gap
+  parity, and the per-venv "global" scoping caveat.
+- No behavior invented beyond what the Ruby reference files above define,
+  except the explicitly confirmed pip-packaging-parity and
+  reversions-reproduced-exactly decisions.
