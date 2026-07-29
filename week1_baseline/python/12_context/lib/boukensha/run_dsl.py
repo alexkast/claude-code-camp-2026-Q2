@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+import os
+from typing import Any, Callable
+
+from . import backends, models
+from ._state import config
+from .agent import Agent
+from .client import Client
+from .config import Config
+from .context import Context
+from .logger import Logger
+from .prompt_builder import PromptBuilder
+from .registry import Registry
+from .repl import Repl
+from .tools import file_system, mud as mud_tools, shell
+from .tui import BoukenshaApp
+from .version import VERSION
+
+
+class RunDSL:
+    """The object passed to run()'s/repl()'s setup callback. Exposes only
+    `tool`, keeping the DSL surface intentionally small."""
+
+    def __init__(self, registry: Registry) -> None:
+        self.registry = registry
+
+    def tool(
+        self,
+        name: str,
+        *,
+        description: str,
+        parameters: dict[str, Any] | None = None,
+        block: Callable[..., Any] | None = None,
+    ) -> Any:
+        return self.registry.tool(name, description=description, parameters=parameters, block=block)
+
+
+# Build a mud options dict from config (used when mud=None is passed to
+# run()/repl()). Returns None if no MUD host is configured.
+def _mud_opts_from_config(cfg: Config) -> dict[str, Any] | None:
+    if not (cfg.mud_host() and cfg.mud_username()):
+        return None
+    return {
+        "host": cfg.mud_host(),
+        "port": cfg.mud_port(),
+        "name": cfg.mud_username(),
+        "password": cfg.mud_password(),
+    }
+
+
+# The top-level entry point. Wires together every primitive so the caller
+# only has to describe *what* to do, not *how* to plumb it.
+#
+#   def register_tools(dsl):
+#       dsl.tool(
+#           "read_file",
+#           description="Read a file from disk",
+#           parameters={"path": {"type": "string", "description": "File path"}},
+#           block=lambda *, path: Path(path).read_text(),
+#       )
+#
+#   result = run(task="Summarise lib/boukensha.py", setup=register_tools)
+#
+# Options:
+#   task:         (required) The user message to hand the agent.
+#   system:       System prompt. Defaults to config.system_prompt.
+#   model:        Model name. Defaults to config.model().
+#   backend:      "anthropic" (default), "openai", "gemini", "ollama", or "ollama_cloud".
+#   api_key:      API key for the chosen backend. Defaults to the matching
+#                 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / OLLAMA_API_KEY
+#                 env var (loaded from .boukensha/.env). Not needed for "ollama".
+#   ollama_host:  Ollama base URL. Defaults to "http://localhost:11434".
+#   log:          Optional JSONL path override. Defaults to .boukensha/sessions/<session-id>.jsonl.
+#   context_window: The model's maximum input token capacity. Defaults to
+#                 models.context_window(model) (a static model->window
+#                 lookup table, separate from each backend's own MODELS
+#                 table -- see the README for the known discrepancy this
+#                 causes for non-default models).
+#   max_output_tokens: Per-reply output cap. Defaults to config.agent_max_output_tokens().
+#   working_dir:  Roots all tool calls to this directory (default: os.getcwd()).
+#                 Registers boukensha.tools.file_system (pwd, read_file,
+#                 write_file, delete_file) and boukensha.tools.shell
+#                 (run_command) automatically.
+#                 Pass working_dir=False to opt out entirely.
+#   allowed_commands: List of shell-executable names the agent is allowed to
+#                 run via run_command (e.g. ["python", "git"]).
+#                 None (default) permits everything -- useful for demos.
+#                 Pass an empty list [] to disable run_command entirely.
+#   shell_timeout: Seconds before a run_command is killed (default 30).
+#   mud:          Dict of MUD connection options -- registers all MUD gameplay
+#                 tools and keeps a single session alive across every tool call.
+#                 When None (default), config.mud_* values are used if mud_host
+#                 is set in settings.yaml. Pass mud=False to disable entirely.
+#   setup:        Optional callback receiving a RunDSL to register tools on.
+#
+# max_iterations/max_turn_tokens are NOT exposed here -- they always come
+# from config.agent_max_iterations()/config.agent_max_turn_tokens(), with no
+# override capability through this API surface (matches Ruby exactly).
+def run(
+    *,
+    task: str,
+    system: str | None = None,
+    model: str | None = None,
+    backend: str | None = None,
+    api_key: str | None = None,
+    ollama_host: str = "http://localhost:11434",
+    log: str | None = None,
+    context_window: int | None = None,
+    max_output_tokens: int | None = None,
+    working_dir: str | bool | None = None,
+    allowed_commands: list[str] | None = None,
+    shell_timeout: float = 30,
+    mud: dict[str, Any] | bool | None = None,
+    setup: Callable[[RunDSL], None] | None = None,
+) -> str:
+    if working_dir is None:
+        working_dir = os.getcwd()
+
+    logger = None
+    try:
+        cfg = config()  # loads .env; populates os.environ
+        if system is None:
+            system = cfg.system_prompt
+        if model is None:
+            model = cfg.model()
+        if context_window is None:
+            context_window = models.context_window(model)
+        if backend is None:
+            backend = cfg.provider_type()
+        if api_key is None:
+            api_key = {
+                "anthropic": os.environ.get("ANTHROPIC_API_KEY"),
+                "openai": os.environ.get("OPENAI_API_KEY"),
+                "gemini": os.environ.get("GEMINI_API_KEY"),
+                "ollama_cloud": os.environ.get("OLLAMA_API_KEY"),
+            }.get(backend)
+
+        ctx = Context(
+            system=system,
+            context_window=context_window,
+            working_dir=working_dir or None,
+            compaction_threshold=cfg.agent_compaction_threshold(),
+        )
+        registry = Registry(ctx)
+
+        if working_dir:
+            file_system.register(registry, working_dir=working_dir)
+            shell.register(
+                registry, working_dir=working_dir, timeout=shell_timeout, allowed_commands=allowed_commands
+            )
+
+        # mud=None means "use config if host is set"; mud=False means "skip entirely"
+        resolved_mud = None if mud is False else (mud or _mud_opts_from_config(cfg))
+        if resolved_mud:
+            mud_tools.register(registry, **resolved_mud)
+
+        if setup is not None:
+            setup(RunDSL(registry))
+
+        if backend == "anthropic":
+            be = backends.Anthropic(api_key=api_key, model=model)
+        elif backend == "openai":
+            be = backends.OpenAI(api_key=api_key, model=model)
+        elif backend == "gemini":
+            be = backends.Gemini(api_key=api_key, model=model)
+        elif backend == "ollama":
+            be = backends.Ollama(host=ollama_host, model=model)
+        elif backend == "ollama_cloud":
+            be = backends.OllamaCloud(api_key=api_key, model=model)
+        else:
+            raise ValueError(
+                f"Unknown backend {backend!r}. Use 'anthropic', 'openai', 'gemini', 'ollama', or 'ollama_cloud'."
+            )
+
+        builder = PromptBuilder(ctx, be)
+        client = Client(builder)
+        effective_max_output_tokens = max_output_tokens or cfg.agent_max_output_tokens()
+        logger = Logger(
+            log=log,
+            snapshot={
+                "max_iterations": cfg.agent_max_iterations(),
+                "max_turn_tokens": cfg.agent_max_turn_tokens(),
+                "max_output_tokens": effective_max_output_tokens,
+                "context_window": context_window,
+                "model": model,
+                "provider": backend,
+            },
+        )
+        agent = Agent(
+            context=ctx,
+            registry=registry,
+            builder=builder,
+            client=client,
+            logger=logger,
+            max_iterations=cfg.agent_max_iterations(),
+            max_turn_tokens=cfg.agent_max_turn_tokens(),
+            max_output_tokens=effective_max_output_tokens,
+        )
+
+        ctx.add_message("user", task)
+        return agent.run()
+    finally:
+        if logger is not None:
+            logger.close()
+
+
+# Interactive REPL: register tools once, then loop -- reading tasks from stdin,
+# running the agent, and printing replies -- until the user types /exit or sends EOF.
+#
+# Conversation history accumulates across every turn so the agent always sees
+# the full transcript.
+#
+# Options are the same as run(), minus `task` (the user supplies tasks
+# interactively). system/model/backend/api_key all default to config values.
+#
+# tui: True (default) wraps the REPL in a Textual-based TUI. Pass tui=False
+# (or the --no-tui CLI flag) to fall back to the plain terminal REPL.
+def repl(
+    *,
+    system: str | None = None,
+    model: str | None = None,
+    backend: str | None = None,
+    api_key: str | None = None,
+    ollama_host: str = "http://localhost:11434",
+    log: str | None = None,
+    context_window: int | None = None,
+    max_output_tokens: int | None = None,
+    working_dir: str | bool | None = None,
+    allowed_commands: list[str] | None = None,
+    shell_timeout: float = 30,
+    mud: dict[str, Any] | bool | None = None,
+    tui: bool = True,
+    setup: Callable[[RunDSL], None] | None = None,
+) -> None:
+    if working_dir is None:
+        working_dir = os.getcwd()
+
+    logger = None
+    try:
+        cfg = config()  # loads .env; populates os.environ
+        if system is None:
+            system = cfg.system_prompt
+        if model is None:
+            model = cfg.model()
+        if context_window is None:
+            context_window = models.context_window(model)
+        if backend is None:
+            backend = cfg.provider_type()
+        if api_key is None:
+            api_key = {
+                "anthropic": os.environ.get("ANTHROPIC_API_KEY"),
+                "openai": os.environ.get("OPENAI_API_KEY"),
+                "gemini": os.environ.get("GEMINI_API_KEY"),
+                "ollama_cloud": os.environ.get("OLLAMA_API_KEY"),
+            }.get(backend)
+
+        ctx = Context(
+            system=system,
+            context_window=context_window,
+            working_dir=working_dir or None,
+            compaction_threshold=cfg.agent_compaction_threshold(),
+        )
+        registry = Registry(ctx)
+
+        if working_dir:
+            file_system.register(registry, working_dir=working_dir)
+            shell.register(
+                registry, working_dir=working_dir, timeout=shell_timeout, allowed_commands=allowed_commands
+            )
+
+        resolved_mud = None if mud is False else (mud or _mud_opts_from_config(cfg))
+        if resolved_mud:
+            mud_tools.register(registry, **resolved_mud)
+
+        if setup is not None:
+            setup(RunDSL(registry))
+
+        if backend == "anthropic":
+            be = backends.Anthropic(api_key=api_key, model=model)
+        elif backend == "openai":
+            be = backends.OpenAI(api_key=api_key, model=model)
+        elif backend == "gemini":
+            be = backends.Gemini(api_key=api_key, model=model)
+        elif backend == "ollama":
+            be = backends.Ollama(host=ollama_host, model=model)
+        elif backend == "ollama_cloud":
+            be = backends.OllamaCloud(api_key=api_key, model=model)
+        else:
+            raise ValueError(
+                f"Unknown backend {backend!r}. Use 'anthropic', 'openai', 'gemini', 'ollama', or 'ollama_cloud'."
+            )
+
+        builder = PromptBuilder(ctx, be)
+        client = Client(builder)
+        effective_max_output_tokens = max_output_tokens or cfg.agent_max_output_tokens()
+        logger = Logger(
+            log=log,
+            snapshot={
+                "max_iterations": cfg.agent_max_iterations(),
+                "max_turn_tokens": cfg.agent_max_turn_tokens(),
+                "max_output_tokens": effective_max_output_tokens,
+                "context_window": context_window,
+                "model": model,
+                "provider": backend,
+            },
+        )
+
+        repl_instance = Repl(
+            context=ctx,
+            registry=registry,
+            builder=builder,
+            client=client,
+            logger=logger,
+            max_iterations=cfg.agent_max_iterations(),
+            max_turn_tokens=cfg.agent_max_turn_tokens(),
+            max_output_tokens=effective_max_output_tokens,
+            config_dir=cfg.dir,
+            provider=backend,
+            model=model,
+            version=VERSION,
+            api_key=api_key,
+            mud=resolved_mud,
+        )
+
+        if tui:
+            BoukenshaApp(repl_instance).run()
+        else:
+            repl_instance.start()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        if logger is not None:
+            logger.close()

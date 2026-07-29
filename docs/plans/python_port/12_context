@@ -1,0 +1,244 @@
+# Python Port Plan — Step 12: Context Management
+
+## Goal
+
+Port `week1_baseline/ruby/12_context` to `week1_baseline/python/12_context`.
+This is a large step: it adds real context-window tracking, colour-coded
+usage indicators, and automatic/manual compaction; it adds "reasoning"
+(extended-thinking) content-block support across all 5 LLM backends
+(Anthropic, OpenAI, Gemini, Ollama, OllamaCloud) — including OpenAI's switch
+from the Chat Completions API to the Responses API entirely; and it **removes
+the `Tasks::Base`/`Tasks::Player` abstraction layer entirely**, inlining what
+it did directly into `Config`. Version bumps to `0.12.0`.
+
+Confirmed via diff against `11_tui`: `agent.rb`, `config.rb`, `context.rb`,
+`errors.rb` (reformatted only, same 4 classes), `logger.rb`,
+`prompt_builder.rb` (unchanged — pure facade, no diff), `repl.rb`, `tui.rb`,
+`version.rb`, `tools/file_system.rb`, `boukensha.rb`, and all 5
+`backends/*.rb` changed. New file: `lib/boukensha/models.rb`. **Removed**:
+`lib/boukensha/tasks/base.rb`, `lib/boukensha/tasks/player.rb`,
+`prompts/system.md` (the bundled default system prompt). `client.rb`,
+`message.rb`, `registry.rb`, `run_dsl.rb`, `tool.rb`, `tools/mud.rb`,
+`tools/shell.rb`, `boukensha_loader.rb`, `examples/example.rb` are all
+byte-identical to step 11 and need no new translation work.
+
+## Design decisions confirmed with user
+
+- **`Models.context_window` vs. each backend's own `MODELS` table — reproduce
+  faithfully.** Ruby's new `Boukensha::Models.context_window(model)` (used to
+  default `Context#context_window` in `run`/`repl` when no explicit
+  `context_window:` is passed) is a *separate*, much cruder table than each
+  backend's own `MODELS` constant: it only has 3 Anthropic model entries (all
+  hard-coded to 200,000, even though Anthropic's own `MODELS` table says
+  Opus/Sonnet are 1,000,000-token windows) and a `32,000` default for
+  everything else (so OpenAI/Gemini/Ollama models — which really have
+  400K–1M+ windows per their own tables — silently get treated as 32,000
+  unless the caller passes `context_window:` explicitly). The two tables are
+  never reconciled in Ruby. **Confirmed: port this exactly as-is**, including
+  the mismatch — this is consistent with this project's standing precedent
+  of reproducing Ruby's real behavior (bugs and reversions included) rather
+  than silently fixing it. Document the discrepancy clearly in the Python
+  README.
+
+## Reference files (Ruby source of truth)
+
+| Ruby file | What it defines / what changed |
+|---|---|
+| `lib/boukensha/version.rb` | `VERSION = "0.12.0"` |
+| `lib/boukensha/models.rb` | **New.** `module Models`: `TABLE` (3 Anthropic model → `{context_window:}` entries), `DEFAULT_CONTEXT_WINDOW = 32_000`, `self.context_window(model)` — looks up `TABLE`, falls back to the default. |
+| `lib/boukensha/config.rb` | **Rewritten.** No more `Tasks::Player` indirection: `provider_type` (`dig(:tasks,:player,:provider) \|\| "anthropic"`), `model` (`dig(:tasks,:player,:model) \|\| "claude-haiku-4-5"`), `system_prompt` (now an eagerly-computed `attr_reader`, resolved once in `initialize` via a private `load_system_prompt` — same `tasks.player.prompt_override.system` YAML key gates a `prompts/player/system.md` override, falling back to flat `prompts/system.md`; **no bundled-default fallback at all** — nil if neither file exists), plus 4 new agent-limit readers: `agent_max_iterations` (default 25), `agent_max_output_tokens` (default 1024), `agent_max_turn_tokens` (default 60,000), `agent_compaction_threshold` (default 0.85). `mud_*`, `dig`, `to_s`/`inspect` unchanged in spirit (just re-pointed at the new fields). **Removed**: the generic `tasks(name)` reader and `user_prompts_dir` — nothing calls them anymore. |
+| `lib/boukensha/context.rb` | **Rewritten.** `initialize(system:, context_window: 200_000, working_dir: nil, compaction_threshold: 0.85)` — `system:` is required (no default), `task:` is gone entirely. New fields: `context_window`, `compaction_threshold`, `current_tokens` (accessor), `turn_tokens` (reader). New methods: `update_tokens(n)`, `reset_turn_tokens`, `add_turn_tokens(input, output)`, `usage_fraction` (0.0–1.0), `usage_pct` (rounded 0–100 int), `needs_compaction?(threshold: compaction_threshold)`, `compact_messages!(target_fraction: 0.60)` (drops oldest `ceil(40%)` messages, floor of `size - 2` kept, resets `current_tokens` to 0, returns dropped count), `clear_messages!` (now also resets `current_tokens` to 0). `to_s` → `"#<Context turns=N tools=N window=N current=N>"` (no more `task=`). |
+| `lib/boukensha/agent.rb` | **Rewritten.** Constructor drops `task_settings:`, adds `max_turn_tokens: nil`. `run`: calls `@context.reset_turn_tokens` then a new private `compact_if_needed` *before* the loop; loop now checks two independent ceilings each iteration — `iteration_limit_reached?` and a new `token_limit_reached?` (`@context.turn_tokens >= @max_turn_tokens`) — either one triggers `wrap_up`. New `compact_if_needed`: if `@context.needs_compaction?`, calls `@context.compact_messages!` and `@logger.compaction(before:, dropped:, context_window:)`. `record_usage` now also calls `@context.update_tokens(usage["input_tokens"])` (window-pressure tracking) alongside the existing turn-token accumulation. `@logger.prompt(...)` gains a `context_window:` arg. New `log_reasoning(content)` — called right after `record_usage` on every response — emits one `@logger.reasoning(text:, redacted:)` per `"reasoning"`-type content block (skipping empty non-redacted ones). `handle_tool_calls` now extracts the preamble text and logs it via a new `@logger.plan(text:)` call before the tool-call placeholder response. **`@logger.response(...)` calls no longer pass `task:`/`backend:`** (see logger.rb below — that metadata enrichment is gone). |
+| `lib/boukensha/errors.rb` | Same 4 exception classes (`UnknownToolError`, `ApiError`, `LoopError`, `UnsupportedModelError`), just reformatted onto one line each — no behavior change. Python's `TurnCancelled` (step 11's Python-only addition for cooperative cancellation) is untouched and unaffected. |
+| `lib/boukensha/logger.rb` | **Real regression, confirmed via diff (not README drift) — reproduce faithfully.** `response(text:, usage: nil, stop_reason: nil)` **no longer takes `task:`/`backend:`** and the whole cost/provider/model/usage-unit enrichment machinery (`execution_metadata`, `estimate_cost`, `task_name`, `provider_name`, `usage_tokens`, `first_integer`) is **deleted from this file entirely** — a "response" log event is now just `{phase, text, usage, stop_reason}`. `prompt(messages:, tools:, context_window:)` gains the new `context_window:` kwarg. Two new methods: `compaction(before:, dropped:, context_window:)` → phase `"compaction"`; `reasoning(text:, redacted: false)` → phase `"reasoning"`; `plan(text:)` → phase `"plan"`. Everything else (`turn`, `iteration`, `limit_reached`, `turn_end`, `tool_call`, `tool_result`, `raw`, `subscribe`, `close`, `write_log`) unchanged. |
+| `lib/boukensha/prompt_builder.rb` | **Byte-identical in behavior** (pure facade: `to_messages`/`to_tools`/`to_api_payload`/`parse_response`/`headers`/`url` all just delegate to the backend). All reasoning-block handling lives entirely in the backends, not here — no Python changes needed to `prompt_builder.py` beyond what backend signature changes require. |
+| `lib/boukensha/repl.rb` | **Additive on top of step 11's refactor** (which already made `on_output`/`handle_command`/`run_turn` public — that shape is unchanged). Constructor drops the old task-settings plumbing implicitly (no `task_settings:` was ever a Repl param — no change there) and gains `max_turn_tokens: nil` alongside existing `max_iterations:`/`max_output_tokens:`. `HELP` and `banner` both gain a `/compact` line. New `handle_command` case: `"/compact"` → `dropped = @context.compact_messages!; output("(compacted context — #{dropped} messages dropped)"); :command`. `run_turn` passes `max_turn_tokens:` through to the `Agent` it constructs. Everything else (banner's mud-status probing, `/exit`/`/quit`/`/help`/`/clear`) unchanged from step 11. |
+| `lib/boukensha/tui.rb` | **Additive on top of step 11's Textual^H^H^Hcharm TUI.** `ANSI_COLORS` gains `yellow: "#ffcc00"` and `red: "#ff5555"`. New class constants `CTX_WARN_PCT = 70`, `CTX_ALERT_PCT = 85`. New private `ctx_color(pct)`: `>= 85` → `:red`, `70..84` → `:yellow`, else `:bright_black`. **The idle progress line and status line now read `@context.current_tokens`/`@context.context_window`/`@context.usage_pct` directly**, replacing step 11's `@session_input_tokens` cumulative-sum tracking entirely (that field, and all `@session_input_tokens`/`@session_output_tokens` accumulation in `handle_event`'s `"response"` case, is **removed** — this fixes the exact bug the README describes: usage no longer grows unboundedly across turns/after `/clear`, because it now reflects `current_tokens`, which `Context#update_tokens`/`clear_messages!`/`compact_messages!` manage directly). `render_status`'s bar format changes to `" boukensha vX · model  ·  ctx used/max (pct%) [⚠ ]·  N tools  ·  HH:MM:SS "` (the `⚠` appears only at `>= 85%`). New `handle_event` case `"compaction"` → appends `"[context compacted — N messages dropped to free space]"` to the conversation and marks dirty. Textarea/viewport width-recalculation on resize (`@textarea.width = @width - Repl::PROMPT.length`) is a bubbletea-specific cosmetic tweak with no Textual equivalent needed (Textual's CSS layout already handles `Input` sizing) — not ported. |
+| `lib/boukensha/backends/base.rb` | Structurally unchanged (`models`/`model_info`/`validate_model!`/`context_window`/cost helpers/`configure_model` all identical) — only the class doc-comment changed, now documenting the normalized response contract's `"reasoning"` block shape: `{"type"=>"reasoning", "text"=>..., "signature"=>... (optional), "redacted"=>true\|false (optional)}`, ordered *before* `"text"`/`"tool_use"` blocks. Port this doc-comment into `base.py`. |
+| `lib/boukensha/backends/anthropic.rb` | `to_messages` (no `system` param — system is a separate top-level payload field, matching existing Python) gains a `when :assistant` branch: `{role: "assistant", content: assistant_content(msg.content)}`. `parse_response` now maps every response block through a new private `normalize_block`: native `"thinking"` → `{"type"=>"reasoning", "text"=>block["thinking"], "signature"=>block["signature"]}`; native `"redacted_thinking"` → `{"type"=>"reasoning", "text"=>"", "redacted"=>true, "signature"=>block["data"]}`; anything else passes through unchanged. New private `assistant_content(content)` (returns bare strings unchanged; otherwise maps each block through `denormalize_block`) and `denormalize_block(block)`: non-reasoning blocks pass through; reasoning blocks re-emit as native `"redacted_thinking"` (`{"type"=>"redacted_thinking", "data"=>block["signature"]}`) or `"thinking"` (`{"type"=>"thinking", "thinking"=>block["text"], "signature"=>block["signature"]}`) so signatures round-trip — Anthropic requires unmodified thinking blocks echoed back on the same model. `MODELS` table: `claude-haiku-4-5` (200K), `claude-sonnet-4-6` (1M), `claude-opus-4-8` (1M) — the standalone `claude-haiku-4-5-20251001` entry from step 11 is dropped. No request-side "enable thinking" param — Anthropic thinking is always-on server-side for these models (not a payload toggle in this backend). |
+| `lib/boukensha/backends/openai.rb` | **Major rewrite: Chat Completions → Responses API.** `BASE_URL` → `https://api.openai.com/v1/responses`. `to_messages(system, messages)` → renamed **`to_input(messages)`** (no `system` param): `:tool_result` → `[{type: "function_call_output", call_id: msg.tool_use_id, output: msg.content.to_s}]`; `:assistant` → `assistant_items(msg.content)`; else → `[{role: msg.role.to_s, content: msg.content}]`. `to_tools` → flat (no `function:` wrapper): `{type: "function", name:, description:, parameters: {...}}`. `to_payload` → `{model:, instructions: context.system, input: to_input(context.messages), tools:, max_output_tokens:, reasoning: {effort: "none"}}` (note: `max_output_tokens`, not `max_completion_tokens`; system prompt is `instructions`, not an `input` item). `parse_response` reads `response["output"]` array: `"reasoning"` items → `{"type"=>"reasoning", "text"=>(summary[].text joined)}`; `"message"` items → join `output_text`-typed content parts into `{"type"=>"text", "text"=>...}` (skipped if empty); `"function_call"` items are collected separately then appended as `{"type"=>"tool_use", "id"=>fc["call_id"], "name"=>fc["name"], "input"=>JSON.parse(fc["arguments"] \|\| "{}")}`; `stop_reason` is `"tool_use"` iff any function calls were present. New private `assistant_items(content)`: wraps bare-string content as a single text block first; joins all text blocks into one `{role: "assistant", content: text}` item (omitted entirely if empty); each tool_use block becomes `{type: "function_call", call_id: b["id"], name: b["name"], arguments: b["input"].to_json}`; **reasoning blocks are dropped** (not echoed back — gpt-5.x doesn't need it when `reasoning.effort` is `"none"`). `MODELS`: `gpt-5.5` (1M), `gpt-5.4-mini` (400K), `gpt-5.4-nano` (400K) — `gpt-5.4` (non-mini) is dropped. |
+| `lib/boukensha/backends/gemini.rb` | `to_payload`'s `generationConfig` gains `thinkingConfig: thinking_config`. New private `thinking_config`: `"gemini-3.1-pro-preview-customtools"` → `{thinkingLevel: "LOW"}` (full disable unsupported on that model); else (`gemini-3.5-flash`, `gemini-3.1-flash-lite`) → `{thinkingBudget: 0}`. `parse_response`: `functionCall` parts now also carry `"signature" => part["thoughtSignature"]` in the emitted tool_use block; new `elsif part["thought"]` branch → `{"type"=>"reasoning", "text"=>part["text"], "signature"=>part["thoughtSignature"]}`. `assistant_parts` (rebuilds "model" turn parts): `tool_use` → `{functionCall: {name:, args:}}` plus `thoughtSignature: b["signature"]` *only if present*; new `reasoning` case → `{text: b["text"], thought: true}` plus `thoughtSignature` if present. `MODELS`: `gemini-3.5-flash` (1,048,576), `gemini-3.1-flash-lite` (1,048,576) — `gemini-2.5-pro`/`gemini-2.5-flash`/`gemini-2.5-flash-lite` are dropped (a commented-out `gemini-3.1-pro-preview-customtools` entry is left as a Ruby comment — no Python equivalent needed, just don't add that model). |
+| `lib/boukensha/backends/ollama.rb` | `to_payload` gains `think: false` (thinking explicitly disabled in the request). `parse_response` gains a `message["thinking"]` check *before* the text check: if present and non-empty → `{"type"=>"reasoning", "text"=>message["thinking"]}` prepended to content. `assistant_message`: unchanged structurally, reasoning blocks are simply not in `text_blocks`/`tool_blocks` so they're naturally dropped when rebuilding (no explicit "drop" code needed — falls out of the existing filter-by-type logic). `MODELS` shrinks to a single entry: `gemma4:e4b` (128K) — all other entries (`gemma4`, `gemma4:e2b`, `gemma4:12b`, `gemma4:26b`, `gemma4:31b`, `qwen3:30b`, `qwen3:8b`, `deepseek-r1:8b`) are removed. |
+| `lib/boukensha/backends/ollama_cloud.rb` | Same `parse_response`/`assistant_message` reasoning handling as `ollama.rb` (`message["thinking"]` → reasoning block, prepended before text). **No `think: false`** in `to_payload` (unlike plain Ollama) — OllamaCloud's request payload is unchanged from step 11 otherwise. `MODELS`: `gemma4:31b-cloud` (256K), `kimi-k2.5:cloud` (256K), `minimax-m3:cloud` (512K, `advertised_context_window: 1_000_000`) — same 3 entries as step 11, just reordered in the source (kimi before minimax) with no semantic change. |
+| `lib/boukensha/tools/file_system.rb` | `list_directory` and `search_files` tool registrations are **commented out** (left in place as dead code with an explanatory comment — "leftover from when this app was a coding harness; the player agent has no use for them yet" — kept so they can be re-registered later). Only `pwd`, `read_file`, `write_file`, `delete_file` are actually registered now. |
+| `lib/boukensha/run_dsl.rb` | **Unchanged** — pure plumbing (`RunDSL#initialize(registry)` + `#tool(name, description:, parameters: {}, &block)` delegating to `registry.tool`). No port work needed beyond what already exists. |
+| `lib/boukensha.rb` | `self.run`/`self.repl` rewritten: no more `Tasks::Player`/`cfg.tasks(...)` — `system \|\|= cfg.system_prompt`, `model \|\|= cfg.model`, `backend \|\|= cfg.provider_type.to_sym`, new `context_window: nil` param defaulting via `context_window \|\|= Models.context_window(model)`. `Context.new` gains `context_window:`/`compaction_threshold: cfg.agent_compaction_threshold`. `Agent`/`Repl`/`Logger` construction now sources `max_iterations`/`max_turn_tokens`/`max_output_tokens` from `cfg.agent_max_iterations`/`cfg.agent_max_turn_tokens`/`(max_output_tokens \|\| cfg.agent_max_output_tokens)` — **`max_iterations:`/`max_turn_tokens:` are NOT exposed as `run`/`repl` keyword args at all** (no override capability beyond settings.yaml). `Logger`'s snapshot dict gains `max_turn_tokens:`/`context_window:`. Require order adds `boukensha/models` (after `tool`/`message`, before `context`) and drops `boukensha/tasks/player`. Everything else (`tui:` kwarg, `mud_opts_from_config`, working_dir/allowed_commands/shell_timeout/mud tool registration) unchanged from step 11. |
+| `lib/boukensha_loader.rb` | **Byte-identical to step 11** — `--no-tui` flag and `MUD_NAME` legacy env-var override logic unchanged. |
+| `examples/example.rb` | **Byte-identical to step 11** — still the MUD demo, doesn't exercise context management directly (though it will naturally exercise `context_window`/token-tracking as a side effect of running). |
+| `boukensha.gemspec`, `Gemfile`, `patches/bubbletea/*` | Version bump only / no port-relevant changes. `patches/bubbletea/` remains N/A for Python (documented already in step 11's README). |
+
+## Reuse: copy verbatim from `python/11_tui`
+
+No Ruby diff, no Python changes needed — copy directly:
+
+- `lib/boukensha/client.py`
+- `lib/boukensha/message.py`
+- `lib/boukensha/registry.py`
+- `lib/boukensha/tool.py`
+- `lib/boukensha/tools/__init__.py`, `tools/mud.py`, `tools/shell.py`
+- `lib/boukensha/mud_session.py`, `lib/boukensha/mud_primitives.py`
+- `lib/boukensha/backends/__init__.py`
+- `lib/boukensha_loader.py`
+- `examples/example.py`
+- `pyproject.toml`'s overall shape (bump version + no new deps needed — no
+  new third-party library required for this step)
+
+## Conventions inherited from prior steps (not re-litigated here)
+
+Python 3.11+, type hints throughout, literal 1:1 mirror of Ruby's
+class/classmethod/module structure (module-level functions for Ruby
+namespacing modules — e.g. `models.py` gets module-level `TABLE`,
+`DEFAULT_CONTEXT_WINDOW`, and a `context_window(model)` function, matching
+the existing `tools/*.py` precedent, not a wrapper class), string-only dict
+keys, `pip install -e .` packaging (established since step 09), bin wrapper
+executable-bit convention, README documents real code behavior only.
+Established precedent from steps 9/10/11: reproduce Ruby's reversions/quirks
+faithfully rather than silently "fixing" them (applies here to the dropped
+logger metadata fields, the disabled file_system tools, the removed bundled
+`prompts/system.md`, and the `Models`/backend context-window mismatch per
+the confirmed design decision above).
+
+## Target files to create/modify
+
+```
+week1_baseline/python/12_context/
+  lib/boukensha_loader.py          # copied verbatim
+  lib/boukensha/version.py         # "0.12.0"
+  lib/boukensha/models.py          # NEW: TABLE, DEFAULT_CONTEXT_WINDOW, context_window(model)
+  lib/boukensha/config.py          # rewritten: provider_type()/model()/system_prompt (eager attr)/
+                                    #   agent_max_iterations()/agent_max_output_tokens()/
+                                    #   agent_max_turn_tokens()/agent_compaction_threshold();
+                                    #   drop tasks()/user_prompts_dir()/PROMPTS_DIR
+  lib/boukensha/context.py         # rewritten: context_window/compaction_threshold/current_tokens/
+                                    #   turn_tokens + update_tokens/reset_turn_tokens/add_turn_tokens/
+                                    #   usage_fraction/usage_pct/needs_compaction/compact_messages;
+                                    #   drop `task`
+  lib/boukensha/agent.py           # rewritten: drop task_settings, add max_turn_tokens + token
+                                    #   ceiling, compact_if_needed, log_reasoning, plan logging;
+                                    #   keep the step-11 cancel_event/TurnCancelled mechanism intact
+  lib/boukensha/errors.py          # same 4 classes + TurnCancelled (Python-only, unaffected)
+  lib/boukensha/logger.py          # response() loses task=/backend=/cost-metadata machinery;
+                                    #   prompt() gains context_window=; new compaction()/reasoning()/
+                                    #   plan() methods
+  lib/boukensha/prompt_builder.py  # copied verbatim (pure facade, no behavior change)
+  lib/boukensha/repl.py            # add /compact command + HELP/banner line + max_turn_tokens
+                                    #   plumbing; on_output/handle_command/run_turn/interrupt()
+                                    #   from step 11 unchanged
+  lib/boukensha/tui.py             # add context-window colour coding (ctx_color, CTX_WARN_PCT=70,
+                                    #   CTX_ALERT_PCT=85), compaction event handling, switch
+                                    #   idle progress/status rendering to context.current_tokens/
+                                    #   context_window/usage_pct; remove session_input/output_tokens
+                                    #   accumulation entirely
+  lib/boukensha/run_dsl.py         # run()/repl(): drop task_settings-based resolution, add
+                                    #   context_window resolution via models.context_window(model),
+                                    #   wire cfg.agent_* into Agent/Repl/Logger construction
+  lib/boukensha/backends/base.py   # copied verbatim except updated docstring (reasoning contract)
+  lib/boukensha/backends/anthropic.py   # rewritten: assistant_content/denormalize_block,
+                                          #   normalize_block, updated MODELS
+  lib/boukensha/backends/openai.py      # rewritten: Responses API (to_input/assistant_items,
+                                          #   instructions/input/reasoning fields), updated MODELS
+  lib/boukensha/backends/gemini.py      # rewritten: thinking_config, reasoning parse/rebuild,
+                                          #   updated MODELS
+  lib/boukensha/backends/ollama.py      # rewritten: think:false, reasoning parse, updated MODELS
+                                          #   (single entry: gemma4:e4b)
+  lib/boukensha/backends/ollama_cloud.py  # rewritten: reasoning parse (no think:false), MODELS
+                                          #   unchanged (3 entries, reordered)
+  lib/boukensha/tasks/                  # REMOVED — no Tasks::Base/Tasks::Player equivalent ships
+                                          #   in this step
+  lib/boukensha/tools/file_system.py    # list_directory/search_files commented out (kept, matching
+                                          #   Ruby's "leftover" comment), only pwd/read_file/
+                                          #   write_file/delete_file actually registered
+  lib/boukensha/client.py                # copied verbatim
+  lib/boukensha/message.py               # copied verbatim
+  lib/boukensha/registry.py              # copied verbatim
+  lib/boukensha/tool.py                  # copied verbatim
+  lib/boukensha/tools/__init__.py, mud.py, shell.py    # copied verbatim
+  lib/boukensha/mud_session.py, mud_primitives.py      # copied verbatim
+  lib/boukensha/backends/__init__.py     # copied verbatim
+  lib/boukensha/__init__.py              # re-export update: drop Task/Player exports, add Models
+  prompts/                               # REMOVED — no bundled default system.md ships in step 12
+  examples/example.py                    # copied verbatim
+  pyproject.toml                         # version 0.12.0; no new dependencies; drop tasks package
+                                          #   from [tool.setuptools].packages
+  README.md                              # documents context management, reasoning-block contract,
+                                          #   OpenAI Responses API switch, the Models/backend
+                                          #   context_window mismatch (per confirmed design decision),
+                                          #   and the dropped logger cost-metadata fields
+
+week1_baseline/python/bin/12_context     # not executable
+week1_baseline/bin/python/12_context     # executable
+```
+
+## Porting notes / gotchas to handle deliberately
+
+1. **`Context.system` is required, `Context.task` is gone.** Python's
+   `Context.__init__` signature becomes
+   `def __init__(self, *, system: str | None, context_window: int = 200_000, working_dir: str | None = None, compaction_threshold: float = 0.85) -> None:`
+   — no `task` parameter at all (drop `self.task` and the `task.task_name()`
+   branch from `__str__`). `system` has no default value in Ruby (a required
+   keyword) — mirror with no `= None` default on the Python parameter either
+   (still typed `str | None` since the *value* can be null, just not
+   omittable).
+2. **`needs_compaction`'s default-from-instance-attribute trick.** Ruby's
+   `def needs_compaction?(threshold: compaction_threshold)` uses the
+   instance's own `compaction_threshold` attribute as the keyword default —
+   Python can't reference `self` in a parameter default, so:
+   `def needs_compaction(self, threshold: float | None = None) -> bool: threshold = self.compaction_threshold if threshold is None else threshold; return self.usage_fraction >= threshold`.
+3. **`compact_messages!`'s drop-count arithmetic**: `drop_count = min(ceil(len(messages) * 0.40), len(messages) - 2)`, then
+   `drop_count = max(drop_count, 0)` — port with `math.ceil`, preserving the
+   exact `0.40`/`- 2`/`max(…, 0)` sequence (edge case: 0 or 1 messages must
+   not go negative or attempt to drop more than exist).
+4. **`Agent`'s two independent ceilings.** `iteration_limit_reached` (existing) and new `token_limit_reached` (`self.context.turn_tokens >= self.max_turn_tokens`, only when `max_turn_tokens > 0`) are both checked at the top of each loop iteration, *before* the existing step-11 `cancel_event`/`TurnCancelled` check or after it — preserve the Python-only cancellation check's position (top of loop) and add the two Ruby ceiling checks alongside it; whichever trips first (cancellation, iteration limit, or token limit) determines what happens (cancellation raises `TurnCancelled` immediately; either Ruby ceiling triggers `_wrap_up(...)` with the matching `kind` string, `"max_iterations"` or `"max_tokens"`).
+5. **`compact_if_needed`/`reset_turn_tokens` run once per `run()` call, not per iteration** — call them at the very top of `Agent.run()`, before the `while True:` loop starts, matching Ruby's `@context.reset_turn_tokens; compact_if_needed` sequence before `loop do`.
+6. **`log_reasoning` iterates `parsed["content"]` after every response**, tool-use or not — call it right after `record_usage` in both the tool-use branch and the final-response branch (Ruby calls it once, right after `record_usage(response)`, before branching on `stop_reason` — i.e. it always runs, not just on one path). Python: call `self._log_reasoning(parsed["content"])` immediately after `self._record_usage(response)`, before the `if parsed["stop_reason"] == "tool_use":` branch.
+7. **`logger.response(...)` calls drop `task=`/`backend=` entirely** — both the tool-use placeholder response and the final/wrap-up responses. Do not keep the now-dead `_task_name`/`_provider_name`/`_usage_tokens`/`_first_integer`/`_estimate_cost`/`_execution_metadata` helpers in `logger.py` — delete them along with the `task`/`backend` parameters on `response()`, matching Ruby's real removal exactly.
+8. **New Logger methods' exact phase strings**: `compaction` → `"compaction"`, `reasoning` → `"reasoning"`, `plan` → `"plan"`. `prompt`'s new field is literally named `context_window` in the emitted JSON (not `window` or `max_tokens`).
+9. **Anthropic reasoning round-trip is signature-gated, not optional** — when re-serializing an assistant turn that contains a reasoning block, the exact original `signature`/`redacted` values must be preserved unchanged (`denormalize_block`); do not attempt to regenerate or omit them, since Anthropic's API rejects a modified thinking block on a continued turn.
+10. **OpenAI's `to_input` has no `system` parameter** (unlike its own step-11 `to_messages(system, messages)` and unlike Ollama/OllamaCloud, which still take `system` as their first param and prepend a system message) — `instructions` carries the system prompt as a top of top-level payload field instead. Match Ruby's exact per-backend `to_messages`/`to_input` arity: Anthropic and Gemini already take `(messages)` only (no `system` — established since step 11); OpenAI is *newly* `to_input(messages)` (no `system`, replacing its old `to_messages(system, messages)`); Ollama and OllamaCloud *keep* `to_messages(system, messages)` unchanged. Don't unify these signatures across backends — the asymmetry is real and intentional.
+11. **OpenAI tool_use `id` is the Responses API's `call_id`**, not a separate id — `parse_response` sets `"id" => fc["call_id"]`, and `assistant_items` reads it back as `call_id: b["id"]` when rebuilding a `function_call` item. Function results reference this same value via `function_call_output`'s `call_id: msg.tool_use_id`.
+12. **Gemini/Ollama/OllamaCloud reuse the tool/function *name* as the id** (they don't assign call ids) — this was already true before step 12 for tool_use blocks; step 12 just adds `"signature"` alongside it for Gemini's `functionCall` blocks (present whenever `thoughtSignature` is non-nil — Ruby includes the key unconditionally, even if the value is `nil`; Python should match: always include the `"signature"` key in the tool_use dict, whose value may be `None`).
+13. **Gemini's `assistant_parts` only sets `thoughtSignature` when present** (`part[:thoughtSignature] = b["signature"] if b["signature"]`) — unlike the parse side (note 12), the *rebuild* side conditionally omits the key entirely when there's no signature, rather than including it as `None`/`null`. Preserve this asymmetry exactly (conditional key insertion on rebuild, unconditional key presence on parse).
+14. **Ollama's request payload gains `"think": False`; OllamaCloud's does not** — a real, confirmed asymmetry between the two otherwise-near-identical backends. Do not "fix" this into consistency.
+15. **`file_system.py`'s `list_directory`/`search_files`**: comment out the tool registrations (leave the code physically present, matching Ruby's style of keeping it as inactive/commented reference code with the same "leftover from when this app was a coding harness" rationale), rather than deleting the functions outright — a future step could plausibly re-enable them and this project's precedent has been to preserve such Ruby-side "kept for later" comments faithfully.
+16. **`prompts/` directory removal**: delete `week1_baseline/python/12_context/prompts/` entirely (no `system.md` ships). Since the shared `.boukensha/prompts/player/system.md` fixture already exists and `tasks.player.prompt_override.system: true` is already set in the shared `settings.yaml`, `Config._load_system_prompt()` will find and use that file with no bundled fallback needed — verified the fixture is already in place at `/Users/akasterin/Documents/git_repo/edu-repos/claude-code-camp-2026-Q2/.boukensha/prompts/player/system.md`.
+17. **`Config.PROMPTS_DIR` class constant is removed** (nothing references it once `run()`/`repl()` stop calling `Task.system_prompt(..., default_prompts_dir: Config.PROMPTS_DIR)`) — don't leave it dangling as dead code.
+18. **`models.py` mirrors Ruby's `module Models` as a plain Python module** (module-level `TABLE` dict + `DEFAULT_CONTEXT_WINDOW` + a `context_window(model)` function), matching the established precedent from `tools/file_system.py`/`tools/shell.py`/`tools/mud.py` (Ruby modules-as-namespaces become Python modules with module-level functions, not wrapper classes) — not a class with classmethods.
+19. **`run()`/`repl()` gain a `context_window: int | None = None` parameter** (resolved via `context_window = context_window or models.context_window(model)` after `model` is resolved) but do **not** gain `max_iterations`/`max_turn_tokens` parameters — those are sourced unconditionally from `cfg.agent_max_iterations()`/`cfg.agent_max_turn_tokens()` with no override capability through the Python API surface, matching Ruby exactly.
+20. **`tui.py`'s idle-state rendering must stop tracking `_session_input_tokens`/`_session_output_tokens` as cumulative counters** — replace with direct reads of `self.context.current_tokens`, `self.context.context_window`, `self.context.usage_pct` (properties/methods to add to `context.py`) at render time. This is not optional cleanup; it's required to match Ruby's actual (bug-fixed) behavior described in the README.
+21. **Status bar `⚠` placement**: only shown when `pct >= CTX_ALERT_PCT` (85), rendered as `" ⚠ "` inline in the bar string (note the surrounding spaces), otherwise a single `" "` — an easy off-by-one to get wrong when porting the f-string.
+22. **`pyproject.toml`**: remove `"boukensha.tasks"` from `[tool.setuptools].packages` (no `tasks/` subpackage ships this step); no new third-party dependency is needed (Textual, requests, PyYAML, python-dotenv all carry over unchanged from step 11).
+
+## Acceptance criteria
+
+- `pip install -e .` succeeds; `import boukensha` exposes `VERSION ==
+  "0.12.0"`, `run`, `repl`, `models` (with `context_window(...)` and
+  `TABLE`), and no longer exposes any `Task`/`Player`-related symbols.
+- `Context`/`Agent` unit-testable offline: `usage_fraction`/`usage_pct`/
+  `needs_compaction`/`compact_messages` all behave per the documented
+  arithmetic; `Agent.run()` triggers `compact_if_needed` before its loop and
+  respects both `max_iterations` and the new `max_turn_tokens` ceiling
+  independently; the step-11 `cancel_event`/`TurnCancelled` cooperative
+  cancellation still works unchanged.
+- Each backend's `parse_response`/assistant-rebuild round-trips a
+  synthetic "reasoning" block correctly per its own rules (Anthropic
+  preserves signature exactly; OpenAI/Ollama/OllamaCloud drop it on
+  rebuild; Gemini conditionally includes `thoughtSignature`) — verified via
+  offline unit tests with synthetic API response fixtures (no live API
+  calls needed to verify the parsing/rebuilding logic itself).
+- OpenAI backend's request payload uses `instructions`/`input`/
+  `reasoning: {"effort": "none"}` and targets `/v1/responses`, not the old
+  Chat Completions shape.
+- REPL and TUI both support `/compact`; TUI's status/progress lines
+  colour-code correctly at the 70%/85% thresholds and show `⚠` only at
+  ≥85%, using live `Context` state rather than a cumulative session counter.
+- `week1_baseline/python/12_context/README.md` documents: the context
+  tracking model (`context_window` vs `current_tokens`), colour thresholds,
+  auto/manual compaction, the reasoning content-block contract, the OpenAI
+  Responses API migration, the confirmed `Models`-vs-backend context-window
+  discrepancy (reproduced faithfully, not fixed), and the dropped logger
+  cost-metadata fields.
+- No behavior invented beyond what the Ruby reference files above define,
+  except the two standing Python-only additions carried forward from step
+  11 (Textual as the TUI engine, cooperative `cancel_event`/`TurnCancelled`
+  cancellation) and the confirmed-faithful reproduction of the
+  `Models`/backend context-window mismatch.
