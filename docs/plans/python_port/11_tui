@@ -1,0 +1,311 @@
+# Python Port Plan — Step 11: A Terminal UI
+
+## Goal
+
+Port `week1_baseline/ruby/11_tui` to `week1_baseline/python/11_tui`. Ruby adds
+a full terminal UI on top of step 10's plain REPL, built on the `charm` gem
+(Ruby bindings to Go's bubbletea + lipgloss + bubbles). `Boukensha.repl` gains
+a `tui:` keyword (default `true`); `--no-tui` on the CLI falls back to the
+plain REPL from step 10. `Repl` is refactored so its I/O is driven through
+callbacks (`on_output`, `handle_command`, `run_turn`) instead of hard-coded
+`puts`/`gets`, so a `Tui` class (or any other front-end) can wrap it. Version
+bumps to `0.11.0`.
+
+There is no direct Python equivalent of the `charm`/bubbletea stack, so this
+is a genuine reimplementation rather than a mechanical port for the UI layer
+itself — confirmed with the user:
+
+- **TUI library: Textual.** Chosen over `prompt_toolkit`/`urwid` because its
+  built-in widgets map directly onto the four zones described below (`RichLog`
+  for the scrollable conversation viewport, `Input` for the textarea,
+  reactive attributes + `set_interval` for the live progress/status lines),
+  it has a built-in key-binding system, and CSS-based styling as the lipgloss
+  analog — the closest architectural match to bubbletea's Model/Update/View
+  loop.
+- **Esc-interrupt: cooperative cancellation flag.** Ruby's Esc handler calls
+  `@turn_thread.raise(Interrupt)` — Ruby can deliver an async exception into a
+  running thread at (almost) any point, including mid blocking I/O. Python
+  threads have no safe equivalent (the `ctypes.pythonapi.PyThreadState_SetAsyncExc`
+  trick exists but can corrupt state mid-syscall and is not appropriate for
+  teaching code). Instead: `Agent` gets an optional `cancel_event:
+  threading.Event | None` constructor param, checked once per loop iteration
+  (after the current model/tool round-trip completes, before starting the
+  next one); if set, it raises a new `TurnCancelled` exception that unwinds
+  cleanly up through `Repl.run_turn`. This means a turn can only be
+  interrupted **between** iterations, not mid-API-call or mid-tool-call — a
+  real, documented behavior difference from Ruby, not a bug.
+
+## Reference files (Ruby source of truth)
+
+| Ruby file | What it defines |
+|---|---|
+| `week1_baseline/ruby/11_tui/lib/boukensha/version.rb` | `VERSION = "0.11.0"` (only the version string changed) |
+| `week1_baseline/ruby/11_tui/lib/boukensha/repl.rb` | **Changed.** `/quiet`/`/loud` commands and their HELP/banner lines removed entirely (see Porting note 1). `puts`/`gets` replaced by `on_output(&block)` + `output(str)` private helper. New public `handle_command(input)` (returns `:quit`, `:command`, or `nil`) and `run_turn(input)` (now public, routes through `output`). New `attr_reader :logger, :context, :model, :version`. `start` now delegates command dispatch to `handle_command`. `banner`/`mud_status_string`/`probe_mud` are otherwise unchanged from step 10. |
+| `week1_baseline/ruby/11_tui/lib/boukensha.rb` | **Changed.** Module-level `@quiet`, `self.quiet!`, `self.loud!`, `self.quiet?` all removed (see Porting note 1). `self.repl` gains `tui: true` keyword; after building `repl = Repl.new(...)`, does `if tui && defined?(Tui) then Tui.new(repl).start else repl.start end` instead of unconditionally calling `.start`. Requires `boukensha/tui` at the bottom. `self.run` and `mud_opts_from_config` are unchanged from step 10. |
+| `week1_baseline/ruby/11_tui/lib/boukensha_loader.rb` | **Changed.** `load_and_start_repl` now does `no_tui = ARGV.delete("--no-tui")` and passes `tui: !no_tui` into `Boukensha.repl(**repl_opts)`. **Also carries the `MUD_NAME`/`MUD_HOST`/`MUD_PORT`/`MUD_PASSWORD` legacy env-var override block** — see Porting note 2, this exists in Ruby step 10 too but was missed when step 10 was ported to Python. |
+| `week1_baseline/ruby/11_tui/lib/boukensha/tui.rb` | **New.** `Boukensha::Tui` class — see "The Tui class" section below for full behavior breakdown. |
+| `week1_baseline/ruby/11_tui/lib/boukensha/logger.rb` | Unchanged from step 10 (`subscribe` already existed there — the step 11 README's claim that `Logger#subscribe` is new is stale/inaccurate; document real history, not the README's claim, per established precedent). |
+| `week1_baseline/ruby/11_tui/lib/boukensha/{agent,client,config,context,errors,message,prompt_builder,registry,tool}.rb` | Byte-identical to step 10 — copy the existing Python ports verbatim, except `agent.rb`'s Python counterpart needs the new `cancel_event` param (Ruby's `agent.rb` itself is unchanged; the cancellation mechanism is a Python-only addition, see Design decisions above). |
+| `week1_baseline/ruby/11_tui/lib/boukensha/tasks/{base,player}.rb` | Byte-identical to step 10 — copy verbatim. |
+| `week1_baseline/ruby/11_tui/lib/boukensha/tools/{file_system,mud,shell}.rb` | Byte-identical to step 10 — copy verbatim (including the already-tested `mud_session.py`/`mud_primitives.py` from the Python side, which have no Ruby-file counterpart to re-diff). |
+| `week1_baseline/ruby/11_tui/lib/boukensha/backends/*.rb` | Byte-identical to step 10 — copy verbatim. |
+| `week1_baseline/ruby/11_tui/examples/example.rb` | Unchanged from step 10 (the MUD demo; doesn't exercise the TUI, per the Ruby README's own admission) — copy verbatim. |
+| `week1_baseline/ruby/11_tui/prompts/system.md` | Unchanged — copy verbatim. |
+| `week1_baseline/ruby/11_tui/boukensha.gemspec`, `Gemfile` | Add `charm` as a dependency. Python analog: add `textual` to `pyproject.toml`'s `dependencies`. |
+| `week1_baseline/ruby/11_tui/patches/bubbletea/*` | A C-extension patch for a burst-read bug in the *precompiled* `bubbletea` gem's native code, plus a `ntcharts`-conflict workaround note. **No Python analog** — Textual is pure Python (no native extension to patch), and has no equivalent stdin-input-reader-goroutine architecture. Not ported; note as N/A in the Python README rather than silently dropping it. |
+| `week1_baseline/ruby/11_tui/README.md` | Design rationale, keyboard shortcut table, four-zone layout diagram, `tui:`/`--no-tui` documentation — adapt to describe the real Textual-based implementation, not a re-statement of the Ruby/charm internals. |
+| `week1_baseline/ruby/bin/11_tui`, `week1_baseline/bin/ruby/11_tui` | Per-language wrapper conventions, unchanged pattern from prior steps. |
+
+Confirmed via `diff` against `10_standard_tool_library`: of all `lib/**/*.rb`
+files, only `version.rb`, `repl.rb`, `boukensha.rb`, `boukensha_loader.rb`
+differ, plus the new `tui.rb`. Everything else (`agent.rb`, `client.rb`,
+`config.rb`, `context.rb`, `errors.rb`, `logger.rb`, `message.rb`,
+`prompt_builder.rb`, `registry.rb`, `tool.rb`, `tasks/*.rb`, `tools/*.rb`,
+`backends/*.rb`) is byte-identical. `examples/example.rb` and `bin/boukensha`
+are also byte-identical.
+
+## The Tui class — behavior breakdown (for the Textual translation)
+
+Ruby's `Tui` (bubbletea `Model`) has:
+
+- **State**: `@repl`, `@context`, `@events` (a `Queue`), `@conversation`
+  (array of strings), `@dirty` flag, `@turn_count`, session-level token
+  totals, `@turn_thread`, a `@live` hash (spinner/elapsed/iteration/action/
+  tool-call-count/turn-token-counts), `@width`/`@height`, a `Bubbles::Viewport`,
+  a `Bubbles::TextArea`.
+- **`start`**: seeds `@conversation` with `repl.banner`, registers
+  `repl.on_output { |str| @conversation << str; @dirty = true }` and
+  `repl.logger.subscribe { |event| @events << event }`, focuses the textarea,
+  then runs the bubbletea event loop (`alt_screen: true`, 50ms input poll,
+  30fps).
+- **`init`**: returns self plus a recurring `TickMsg` command (every 60ms).
+- **`update(msg)`**: on `WindowSizeMessage` resizes the viewport; on `TickMsg`
+  drains the event queue and advances the spinner/elapsed time, then
+  reschedules the next tick; on `KeyMessage` dispatches to `handle_key`,
+  quitting the program if it returns `:quit`.
+- **`view`**: re-syncs the viewport content from `@conversation` if dirty,
+  then joins `[viewport, progress line, input line, status line]` with `\n`.
+- **`handle_key`**: `ctrl+c`/`ctrl+d` → quit; `esc` → raise `Interrupt` into
+  `@turn_thread` if alive; `ctrl+l` → `repl.handle_command("/clear")` +
+  reset turn count; `pgup`/`pgdown` → scroll viewport; `enter` →
+  `submit_input`; anything else → forward the keystroke to the textarea.
+- **`submit_input`**: strips/ignores blank input; if it starts with `/`,
+  routes through `repl.handle_command`, quitting or resetting turn count as
+  needed; otherwise appends `"> #{input}"` to the conversation and calls
+  `launch_turn`.
+- **`launch_turn`**: resets `@live`, spawns a `Thread` that calls
+  `repl.run_turn(input)`, pushing a `turn_interrupted`/`turn_error`/
+  `turn_complete` event onto `@events` in `rescue`/`ensure`.
+- **`drain_events`/`handle_event`**: non-blocking-drains the queue each tick;
+  updates `@live`'s iteration/action/tool-call-count/token counts based on
+  `event[:phase]` (`"iteration"`, `"tool_call"`, `"tool_result"`,
+  `"response"`, `"turn_complete"`, `"turn_interrupted"`, `"turn_error"`).
+- **Rendering helpers**: `render_progress` (spinner + action + iteration/max
+  + elapsed + token counts + tool-call count when active, else `[ready]` +
+  context tokens + turn count), `render_input` (green bold prompt + textarea),
+  `render_status` (version · model · context tokens · tool count · clock,
+  full-width bar), `lip` (lipgloss style builder for fg/bg/bold), `fmt_tokens`
+  (`n >= 1000` → `"{n/1000:.1f}k"`, else plain int).
+
+### Textual translation shape
+
+- `Boukensha::Tui` → `boukensha.tui.BoukenshaApp(textual.app.App)`.
+- Four zones → three-widget vertical layout: a `RichLog` (or `Static` inside
+  a `VerticalScroll`) for the conversation viewport, a `Static` for the
+  progress line, a Textual `Input` for the entry box, and a `Static` (or
+  Textual's built-in status bar convention) for the status line. Bubbles'
+  `Viewport`'s `goto_bottom` maps to `RichLog.scroll_end`/auto-scroll.
+  `pgup`/`pgdown` map to `RichLog.scroll_page_up`/`scroll_page_down` (or a
+  key binding calling the same).
+- `TickMsg` / 60ms timer → `self.set_interval(TICK_MS / 1000, self._tick)`
+  started in `on_mount`.
+- The bubbletea `init`/`update`/`view` triple collapses into Textual's
+  `on_mount` (subscribe to `repl.logger`, seed conversation, start timer),
+  reactive attributes + `watch_*` methods (re-render on change instead of a
+  manual `@dirty` flag — Textual's reactive system is the built-in analog),
+  and `compose`/widget `.update(...)` calls instead of a single `view` string.
+- **Threading bridge**: `repl.logger.subscribe(...)` and `repl.on_output(...)`
+  callbacks fire on the *worker thread* running the agent turn (see below),
+  but Textual widgets must only be mutated from the app's own thread/event
+  loop. Both callbacks must marshal onto the main thread via
+  `self.call_from_thread(...)` — this is the direct Python analog of the
+  Ruby version's `Queue`-based `@events`/`drain_events` polling pattern
+  (Ruby needs the queue because bubbletea's tick loop polls it manually;
+  Textual's `call_from_thread` achieves the same cross-thread safety more
+  directly, so the manual queue/drain-on-tick machinery is not needed in the
+  Python port — document this as an intentional simplification enabled by
+  the target framework, not a functional gap).
+- **`launch_turn`** → a method decorated `@work(thread=True, exclusive=True)`
+  (Textual's built-in background-worker API) instead of a raw
+  `threading.Thread` — this is the natural Textual idiom for "run blocking
+  code without freezing the UI" and replaces Ruby's manual `Thread.new` +
+  `rescue`/`ensure` bookkeeping. Catch `TurnCancelled` distinctly (→
+  `turn_interrupted`, mirroring Ruby's `rescue Interrupt`) from any other
+  `Exception` (→ `turn_error`).
+- **`esc` key** → calls `self.repl.interrupt()` (see Design decisions), a new
+  method that sets the shared `cancel_event`, instead of Ruby's
+  `@turn_thread.raise(Interrupt)`.
+- **`event[:phase] || event["phase"]`** — Ruby's dual read exists because
+  in-process Ruby hashes built from keyword args use symbol keys; the
+  `event["phase"]` fallback is dead code in practice. Python's `Logger`
+  already emits string-only-keyed dicts (established since step 6), so
+  `handle_event` just does `event["phase"]` — no dual-read needed, same
+  simplification already applied elsewhere in this port.
+- `ANSI_COLORS` / `lip()` → Textual CSS classes or inline `Style` objects
+  (Textual has its own richer color system; reuse the same four named
+  colors — cyan, bright_black, green, white — as CSS rules in a companion
+  stylesheet or inline styles, whichever keeps `tui.py` self-contained
+  without a separate `.css` file, matching this codebase's one-file-per-
+  concern style so far).
+
+## Design decisions (confirmed with user)
+
+1. **Textual** as the TUI framework (see Goal section for rationale).
+2. **Cooperative cancellation** via `Agent(cancel_event=...)` +
+   `TurnCancelled` exception, checked once per agent-loop iteration boundary,
+   instead of Ruby's `Thread#raise(Interrupt)`. `Repl` gains a
+   `self._cancel_event = threading.Event()` created once in `__init__`, a
+   new public `interrupt()` method (`self._cancel_event.set()`), and clears
+   the event at the top of each `run_turn` call before constructing the
+   `Agent`. This keeps `Repl`'s other public methods' signatures identical
+   to Ruby's (`on_output`, `handle_command`, `run_turn`).
+
+## Porting notes / gotchas to handle deliberately
+
+1. **`/quiet`/`/loud` and `Boukensha.quiet!`/`loud!`/`quiet?` are dropped
+   entirely in Ruby step 11** — not a README-drift issue, a real code change
+   (confirmed via diff: both removed from `repl.rb` and `boukensha.rb`, and
+   nothing replaces them). Per established precedent (reproduce Ruby's
+   reversions faithfully, e.g. step 9's config-resolution reversion, step
+   10's banner reversion), the Python port must remove:
+   - The `/quiet`/`/loud` branches, and their `HELP`/banner lines, from
+     `repl.py`.
+   - `enable_quiet`, `disable_quiet`, `is_quiet` from `_state.py` and their
+     re-exports from `__init__.py.__all__` — grep confirms these are used
+     *only* by `repl.py`'s two removed branches, so removing them is a clean
+     deletion with no dangling references elsewhere in `mud_session.py`,
+     `tools/mud.py`, etc. (those files' unrelated `read_until_quiet` /
+     `quiet_seconds` names are a naming coincidence, not related to this
+     state).
+2. **The `MUD_NAME`/`MUD_HOST`/`MUD_PORT`/`MUD_PASSWORD` legacy env-var
+   override block in `boukensha_loader.rb`'s `load_and_start_repl` was
+   already present in Ruby step 10**, but was missed when
+   `python/10_standard_tool_library/lib/boukensha_loader.py` was ported (its
+   `main()` calls `module.repl()` with no options at all). This plan does
+   not go back and patch step 10; it ports the full logic — env override
+   block *and* the new `--no-tui` handling — into step 11's
+   `boukensha_loader.py.main()`, since step 11's Ruby source depends on both
+   pieces together and step 11 is otherwise a faithful full port. `main()`
+   becomes:
+   ```python
+   def main() -> None:
+       ...
+       no_tui = "--no-tui" in sys.argv
+       if no_tui:
+           sys.argv.remove("--no-tui")
+
+       repl_opts: dict[str, Any] = {"tui": not no_tui}
+
+       if os.environ.get("MUD_NAME"):
+           repl_opts["working_dir"] = False
+           repl_opts["mud"] = {
+               "host": os.environ.get("MUD_HOST", "localhost"),
+               "port": int(os.environ.get("MUD_PORT", "4000")),
+               "name": os.environ["MUD_NAME"],
+               "password": os.environ.get("MUD_PASSWORD") or sys.exit(
+                   "boukensha: MUD_NAME is set but MUD_PASSWORD is missing."
+               ),
+           }
+
+       module.repl(**repl_opts)
+   ```
+3. **`if tui && defined?(Tui)` guard.** In Ruby this is defensive style —
+   `boukensha.rb` unconditionally `require_relative "boukensha/tui"`s at the
+   bottom of the file, so `defined?(Tui)` is always true in practice. Python
+   doesn't need an equivalent guard: `tui.py` is unconditionally importable
+   once `textual` is installed (a hard `pyproject.toml` dependency, not
+   optional), so `run_dsl.py`'s `repl()` just does
+   `if tui: BoukenshaApp(repl_instance).run() else: repl_instance.start()`.
+4. **`Agent`'s new `cancel_event` param is Python-only** — Ruby's
+   `agent.rb` is byte-identical to step 10 and has no cancellation concept at
+   all (Ruby achieves interruption entirely via `Thread#raise` from outside
+   the loop). Document this clearly in the Python README as an addition
+   needed to make Esc-interrupt safe under Python's threading model, not as
+   a 1:1 translation of any Ruby code.
+5. **Slash-command HELP text** in `repl.py`'s `HELP` constant and `_banner()`
+   method must drop the `/quiet or /loud   toggle logging` lines to match
+   Ruby's step-11 `repl.rb` exactly (see Porting note 1).
+6. **`patches/bubbletea/`** — do not attempt to port the C-extension patch or
+   the `ntcharts` conflict workaround; note in the README that Textual has no
+   native-extension burst-read bug or competing-Go-runtime issue to work
+   around, so this entire directory has no Python counterpart.
+7. **Version bump**: `version.py` → `"0.11.0"`, `pyproject.toml`'s
+   `[project].version` → `"0.11.0"`.
+8. **`examples/example.py`** carries over unchanged from step 10 (still the
+   MUD demo, `working_dir=False`) — copy verbatim, no TUI-specific example
+   needed since the TUI is only reachable via the `boukensha` executable, per
+   the Ruby README's own statement.
+9. **New `pyproject.toml` dependency**: add `"textual"` alongside
+   `python-dotenv`, `PyYAML`, `requests`.
+
+## Target files to create
+
+```
+week1_baseline/python/11_tui/
+  lib/boukensha_loader.py          # + --no-tui flag, + MUD_NAME legacy override (see note 2)
+  lib/boukensha/__init__.py        # drop quiet exports, add Tui/BoukenshaApp export
+  lib/boukensha/version.py         # "0.11.0"
+  lib/boukensha/_state.py          # drop enable_quiet/disable_quiet/is_quiet
+  lib/boukensha/errors.py          # + TurnCancelled
+  lib/boukensha/agent.py           # + cancel_event param/check (Python-only addition)
+  lib/boukensha/repl.py            # refactored: on_output/handle_command/run_turn public,
+                                    #   attr readers, /quiet+/loud removed, + interrupt()
+  lib/boukensha/tui.py             # NEW: BoukenshaApp(textual.app.App)
+  lib/boukensha/run_dsl.py         # repl(tui=True) kwarg, dispatches to BoukenshaApp or Repl.start
+  lib/boukensha/context.py         # copied verbatim from python/10_standard_tool_library
+  lib/boukensha/client.py          # copied verbatim
+  lib/boukensha/config.py          # copied verbatim
+  lib/boukensha/logger.py          # copied verbatim (subscribe already exists)
+  lib/boukensha/message.py         # copied verbatim
+  lib/boukensha/prompt_builder.py  # copied verbatim
+  lib/boukensha/registry.py        # copied verbatim
+  lib/boukensha/tool.py            # copied verbatim
+  lib/boukensha/mud_session.py     # copied verbatim
+  lib/boukensha/mud_primitives.py  # copied verbatim
+  lib/boukensha/tasks/__init__.py, base.py, player.py   # copied verbatim
+  lib/boukensha/tools/__init__.py, file_system.py, mud.py, shell.py  # copied verbatim
+  lib/boukensha/backends/*.py      # copied verbatim
+  prompts/system.md                # copied verbatim
+  examples/example.py              # copied verbatim (unchanged MUD demo)
+  pyproject.toml                   # version 0.11.0, + "textual" dependency
+  README.md                        # documents real Textual implementation + Esc/cancellation
+                                    #   design difference + patches/ N/A note
+
+week1_baseline/python/bin/11_tui   # not executable
+week1_baseline/bin/python/11_tui   # executable
+```
+
+## Acceptance criteria
+
+- `pip install -e .` succeeds with `textual` installed; `import boukensha`
+  exposes `VERSION == "0.11.0"`, `run`, `repl`, `Tui`/`BoukenshaApp`, and no
+  longer exposes `enable_quiet`/`disable_quiet`/`is_quiet`.
+- Launching `boukensha` (or the step's bin wrapper) opens the Textual TUI by
+  default; `boukensha --no-tui` falls back to the plain `Repl.start()` loop
+  from step 10 with `/quiet`/`/loud` no longer present in its `/help` output.
+- The TUI's four zones render and update live during a real agent turn
+  (conversation viewport, progress line with spinner/iteration/token counts,
+  input box, status line), verified interactively since a full-screen TUI
+  cannot be meaningfully exercised through scripted/offline tests alone.
+- `Esc` during a running turn sets the cancellation flag and the turn stops
+  at the next iteration boundary, distinctly reported as `[interrupted]`
+  rather than `[error] ...`.
+- `Ctrl+L` clears conversation history and resets the turn counter; `PgUp`/
+  `PgDn` scroll the viewport; `Ctrl+C`/`Ctrl+D` quit cleanly.
+- `MUD_NAME`-based legacy env-var override and `settings.yaml`'s `mud:`
+  block both still work as the two ways to configure the MUD tools, matching
+  Ruby's `boukensha_loader.rb`.
+- No behavior invented beyond what the Ruby reference files define, except
+  the two explicitly-confirmed, explicitly-documented Python-only additions
+  (Textual as the rendering engine, and the cooperative `cancel_event`
+  mechanism replacing `Thread#raise`).
